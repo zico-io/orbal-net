@@ -33,6 +33,7 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 mod server;
+mod tui;
 
 const USAGE: &str = "\
 comms <subcommand> [args]
@@ -46,7 +47,8 @@ comms <subcommand> [args]
   read <room> [--since <seq>]
   peek <room> [--since <seq>]   # read without advancing your cursor (monitoring)
   wait <room> [--since <seq>] [--timeout <secs>]
-  invite <room> <agent> | kick <room> <agent>";
+  invite <room> <agent> | kick <room> <agent>
+  tui [--interval <secs>]   # live full-screen dashboard (alias: watch)";
 
 fn die(msg: impl AsRef<str>) -> ! {
     eprintln!("comms: {}", msg.as_ref());
@@ -61,6 +63,7 @@ fn main() {
             std::process::exit(1);
         }
         Some("serve") => server::run(&args[1..]),
+        Some("tui") | Some("watch") => tui::run(&args[1..]),
         Some("--selfcheck") => match server::selfcheck() {
             Ok(()) => println!("comms selfcheck ok"),
             Err(e) => die(format!("selfcheck failed: {e}")),
@@ -209,7 +212,7 @@ fn client(argv: &[String]) {
 /// Minimal HTTP/1.1 POST over a plain TCP socket. COMMS_URL is always `http://`
 /// (LAN/loopback, Bearer-token auth, no TLS), so a hand-rolled request beats
 /// pulling in a full HTTP+TLS client stack for one call.
-fn http_post(
+pub(crate) fn http_post(
     base: &str,
     token: &str,
     action: &str,

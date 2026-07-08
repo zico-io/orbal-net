@@ -34,7 +34,11 @@ pub fn run(cfg: &Config, shared: Arc<Mutex<Snapshot>>, stop: Arc<AtomicBool>) {
 
         let (health, agents, rooms) = if let Some(reason) = transport_reason {
             // Server unreachable: keep showing the last known-good data, just flag it.
-            (Health::Disconnected(reason), prev_agents.clone(), prev_rooms.clone())
+            (
+                Health::Disconnected(reason),
+                prev_agents.clone(),
+                prev_rooms.clone(),
+            )
         } else {
             let agents = match &agents_res {
                 Ok(v) => parse_agents(v),
@@ -101,13 +105,29 @@ fn peek_rooms(
         .unwrap_or_default();
     let mut out = Vec::with_capacity(arr.len());
     for r in arr {
-        let name = r.get("name").and_then(Value::as_str).unwrap_or("").to_string();
-        let rtype = r.get("type").and_then(Value::as_str).unwrap_or("").to_string();
-        let owner = r.get("owner").and_then(Value::as_str).unwrap_or("").to_string();
+        let name = r
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let rtype = r
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let owner = r
+            .get("owner")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let members = r
             .get("members")
             .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(|m| m.as_str().map(str::to_string)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|m| m.as_str().map(str::to_string))
+                    .collect()
+            })
             .unwrap_or_default();
 
         let prev = prev_rooms.iter().find(|p| p.name == name);
@@ -128,8 +148,16 @@ fn peek_rooms(
                     total_seen += msgs.len() as u64;
                     if let Some(m) = msgs.last() {
                         let seq = m.get("seq").and_then(Value::as_i64).unwrap_or(since);
-                        let from = m.get("from").and_then(Value::as_str).unwrap_or("").to_string();
-                        let text = m.get("text").and_then(Value::as_str).unwrap_or("").to_string();
+                        let from = m
+                            .get("from")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let text = m
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
                         last_seq.insert(name.clone(), seq);
                         last = Some(MsgView { from, text });
                     }
@@ -137,7 +165,14 @@ fn peek_rooms(
             }
         }
 
-        out.push(RoomView { name, rtype, owner, members, total_seen, last });
+        out.push(RoomView {
+            name,
+            rtype,
+            owner,
+            members,
+            total_seen,
+            last,
+        });
     }
     out
 }

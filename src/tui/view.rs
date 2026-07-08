@@ -1,15 +1,14 @@
 //! Render + interaction layer for `comms tui` (alias `watch`). Owned by worker-ui.
 //!
 //! Usage (launch in a herdr pane):
-//!   - Inside an existing mission agent pane (COMMS_URL/COMMS_TOKEN/COMMS_AGENT
-//!     already set by spawn.py): just run
-//!         comms tui
-//!   - In a dedicated observer pane that is NOT a mission agent, set the three
-//!     env vars yourself (any COMMS_AGENT value works - it reads only and is
-//!     filtered out of the displayed roster automatically):
-//!         COMMS_URL=http://<host>:<port> COMMS_TOKEN=<token> COMMS_AGENT=observer comms tui
-//!   - `--interval <secs>` (fractional allowed) overrides the poll cadence, e.g.
-//!         comms tui --interval 0.5
+//! - Inside an existing mission agent pane (COMMS_URL/COMMS_TOKEN/COMMS_AGENT
+//!   already set by spawn.py), just run: `comms tui`
+//! - In a dedicated observer pane that is NOT a mission agent, set the three env
+//!   vars yourself (any COMMS_AGENT value works - it reads only and is filtered
+//!   out of the displayed roster automatically):
+//!   `COMMS_URL=http://<host>:<port> COMMS_TOKEN=<token> COMMS_AGENT=observer comms tui`
+//! - `--interval <secs>` (fractional allowed) overrides the poll cadence, e.g.
+//!   `comms tui --interval 0.5`
 //!
 //! Keys: q / Esc / Ctrl-C quit; Up/k and Down/j move the room selection.
 //!
@@ -161,11 +160,15 @@ fn draw_header(f: &mut Frame, area: Rect, cfg: &Config, snap: &Snapshot) {
     let (health_text, health_style) = match &snap.health {
         Health::Connecting => (
             "CONNECTING".to_string(),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         ),
         Health::Connected => (
             "CONNECTED".to_string(),
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
         ),
         Health::Disconnected(reason) => (
             format!("DISCONNECTED ({reason})"),
@@ -185,17 +188,18 @@ fn draw_header(f: &mut Frame, area: Rect, cfg: &Config, snap: &Snapshot) {
         Span::raw("  "),
         Span::styled(health_text, health_style),
     ]);
-    let line2 = Line::from(vec![
-        Span::raw(format!(
-            "last update: {last_update}   polls: {}   rooms: {}   agents: {}",
-            snap.polls,
-            snap.rooms.len(),
-            snap.agents.iter().filter(|a| a.id != snap.observer).count()
-        )),
-    ]);
+    let line2 = Line::from(vec![Span::raw(format!(
+        "last update: {last_update}   polls: {}   rooms: {}   agents: {}",
+        snap.polls,
+        snap.rooms.len(),
+        snap.agents.iter().filter(|a| a.id != snap.observer).count()
+    ))]);
 
-    let header = Paragraph::new(vec![line1, line2])
-        .block(Block::default().borders(Borders::ALL).title("mission comms"));
+    let header = Paragraph::new(vec![line1, line2]).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("mission comms"),
+    );
     f.render_widget(header, area);
 }
 
@@ -229,7 +233,9 @@ fn draw_rooms(f: &mut Frame, area: Rect, snap: &Snapshot, state: &ViewState) {
 
 fn room_item(room: &RoomView, width: usize, unread: bool) -> ListItem<'static> {
     let base_style = if unread {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
     };
