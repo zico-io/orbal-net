@@ -24,6 +24,8 @@
 //!   comms wait <room> [--since <seq>] [--timeout <secs>]   # blocking long-poll read
 //!   comms invite <room> <agent> | kick <room> <agent>
 
+#![warn(clippy::all)]
+
 use serde_json::{json, Value};
 use std::env;
 use std::io::{Read, Write};
