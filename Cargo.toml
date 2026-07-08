@@ -2,8 +2,9 @@
 name = "comms"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.78"
 description = "Per-mission agent coordination: one binary, client + server, over JSON/HTTP."
+publish = false
 
 [[bin]]
 name = "comms"
