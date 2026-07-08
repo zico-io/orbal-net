@@ -44,6 +44,7 @@ comms <subcommand> [args]
   send <room> <message...>
   dm <agent> <message...>
   read <room> [--since <seq>]
+  peek <room> [--since <seq>]   # read without advancing your cursor (monitoring)
   wait <room> [--since <seq>] [--timeout <secs>]
   invite <room> <agent> | kick <room> <agent>";
 
@@ -129,14 +130,18 @@ fn client(argv: &[String]) {
             body.insert("to".into(), json!(rest[0]));
             body.insert("text".into(), json!(rest[1..].join(" ")));
         }
-        "read" => {
+        "read" | "peek" => {
             let (since, rest) = parse_opt(&rest, "--since");
             if rest.len() != 1 {
-                die("usage: comms read <room> [--since <seq>]");
+                die(format!("usage: comms {cmd} <room> [--since <seq>]"));
             }
             body.insert("room".into(), json!(rest[0]));
             if let Some(s) = since {
                 body.insert("since".into(), json!(s));
+            }
+            // peek reads without advancing the caller's cursor (monitoring).
+            if cmd == "peek" {
+                body.insert("peek".into(), json!(true));
             }
         }
         "wait" => {

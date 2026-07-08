@@ -179,7 +179,7 @@ fn dispatch(conn: &Connection, action: &str, agent: &str, b: &Value) -> OpResult
         "destroy-room" => op_destroy_room(conn, agent, b),
         "send" => op_send(conn, agent, b),
         "dm" => op_dm(conn, agent, b),
-        "read" => op_read(conn, agent, b),
+        "read" | "peek" => op_read(conn, agent, b),
         "inbox" => op_inbox(conn, agent),
         "invite" => op_invite(conn, agent, b),
         "kick" => op_kick(conn, agent, b),
@@ -485,8 +485,13 @@ fn op_read(conn: &Connection, agent: &str, b: &Value) -> OpResult {
     let room = need(b, "room")?;
     let since = opt_i64(b, "since").unwrap_or_else(|| cursor(conn, agent, room));
     let msgs = messages_after(conn, room, since);
-    if let Some(last) = msgs.last() {
-        advance_cursor(conn, agent, room, last["seq"].as_i64().unwrap());
+    // `peek` (non-consuming) leaves the cursor put, so a monitor/human can view a room
+    // without eating messages the agent still needs delivered. Plain `read` advances.
+    let peek = b.get("peek").and_then(Value::as_bool).unwrap_or(false);
+    if !peek {
+        if let Some(last) = msgs.last() {
+            advance_cursor(conn, agent, room, last["seq"].as_i64().unwrap());
+        }
     }
     Ok(json!({ "room": room, "messages": msgs }))
 }
