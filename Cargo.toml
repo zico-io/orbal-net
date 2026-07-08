@@ -1,0 +1,19 @@
+[package]
+name = "comms"
+version = "0.1.0"
+edition = "2021"
+description = "Per-mission agent coordination: one binary, client + server, over JSON/HTTP."
+
+[[bin]]
+name = "comms"
+path = "src/main.rs"
+
+[dependencies]
+tiny_http = "0.12"
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde_json = "1"
+
+[profile.release]
+strip = true
+opt-level = "z"
+lto = true
