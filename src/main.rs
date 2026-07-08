@@ -161,16 +161,16 @@ fn client(argv: &[String]) {
             body.insert("room".into(), json!(rest[0]));
             body.insert("target".into(), json!(rest[1]));
         }
-        other => die(format!("unknown command {other:?} (see comms with no args)")),
+        other => die(format!(
+            "unknown command {other:?} (see comms with no args)"
+        )),
     }
 
     let url = env::var("COMMS_URL").ok();
     let token = env::var("COMMS_TOKEN").ok();
     let agent = env::var("COMMS_AGENT").ok();
     let (url, token, agent) = match (url, token, agent) {
-        (Some(u), Some(t), Some(a)) if !u.is_empty() && !t.is_empty() && !a.is_empty() => {
-            (u, t, a)
-        }
+        (Some(u), Some(t), Some(a)) if !u.is_empty() && !t.is_empty() && !a.is_empty() => (u, t, a),
         _ => die("COMMS_URL, COMMS_TOKEN and COMMS_AGENT must all be set"),
     };
     body.insert("agent".into(), json!(agent));
@@ -238,7 +238,7 @@ fn http_post(
         .nth(1)
         .and_then(|c| c.parse::<u16>().ok())
         .ok_or_else(|| io_err("malformed HTTP response"))?;
-    let body = resp.splitn(2, "\r\n\r\n").nth(1).unwrap_or("").to_string();
+    let body = resp.split_once("\r\n\r\n").map_or("", |x| x.1).to_string();
     Ok((code, body))
 }
 

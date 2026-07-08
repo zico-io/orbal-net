@@ -119,10 +119,9 @@ fn init_schema(conn: &Connection) {
 
 fn handle(state: &State, mut request: tiny_http::Request) {
     // Auth: constant string compare against the mission token.
-    let authorized = request
-        .headers()
-        .iter()
-        .any(|h: &Header| h.field.equiv("Authorization") && h.value.as_str() == bearer(&state.token));
+    let authorized = request.headers().iter().any(|h: &Header| {
+        h.field.equiv("Authorization") && h.value.as_str() == bearer(&state.token)
+    });
     if !authorized {
         return reply(request, 401, json!({ "error": "unauthorized" }));
     }
@@ -137,7 +136,13 @@ fn handle(state: &State, mut request: tiny_http::Request) {
     }
     let agent = match body.get("agent").and_then(Value::as_str) {
         Some(a) if !a.is_empty() => a.to_string(),
-        _ => return reply(request, 400, json!({ "error": "missing 'agent' (set COMMS_AGENT)" })),
+        _ => {
+            return reply(
+                request,
+                400,
+                json!({ "error": "missing 'agent' (set COMMS_AGENT)" }),
+            )
+        }
     };
 
     let result = if action == "wait" {
@@ -198,8 +203,11 @@ fn reply(request: tiny_http::Request, code: u16, payload: Value) {
 }
 
 fn touch(conn: &Connection, agent: &str) {
-    conn.execute("INSERT OR IGNORE INTO agents(id) VALUES(?1)", params![agent])
-        .ok();
+    conn.execute(
+        "INSERT OR IGNORE INTO agents(id) VALUES(?1)",
+        params![agent],
+    )
+    .ok();
 }
 
 /// `--name value` string field, required.
@@ -229,9 +237,11 @@ fn dm_key(a: &str, b: &str) -> String {
 }
 
 fn room_owner(conn: &Connection, name: &str) -> Result<String, Err> {
-    conn.query_row("SELECT owner FROM rooms WHERE name=?1", params![name], |r| {
-        r.get::<_, String>(0)
-    })
+    conn.query_row(
+        "SELECT owner FROM rooms WHERE name=?1",
+        params![name],
+        |r| r.get::<_, String>(0),
+    )
     .optional()
     .expect("query room")
     .ok_or_else(|| err(404, format!("no room {name:?}")))
@@ -321,9 +331,11 @@ fn relevant_rooms(conn: &Connection, agent: &str) -> Vec<String> {
 
 fn op_whoami(conn: &Connection, agent: &str) -> OpResult {
     let status: String = conn
-        .query_row("SELECT status FROM agents WHERE id=?1", params![agent], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT status FROM agents WHERE id=?1",
+            params![agent],
+            |r| r.get(0),
+        )
         .expect("whoami");
     Ok(json!({ "agent": agent, "status": status }))
 }
@@ -343,7 +355,10 @@ fn op_agents(conn: &Connection) -> OpResult {
 fn op_status(conn: &Connection, agent: &str, b: &Value) -> OpResult {
     let state = need(b, "state")?;
     if !STATES.contains(&state) {
-        return Result::Err(err(400, format!("bad state {state:?}; want one of {STATES:?}")));
+        return Result::Err(err(
+            400,
+            format!("bad state {state:?}; want one of {STATES:?}"),
+        ));
     }
     conn.execute(
         "UPDATE agents SET status=?1 WHERE id=?2",
@@ -357,9 +372,11 @@ fn op_create_room(conn: &Connection, agent: &str, b: &Value) -> OpResult {
     let name = need(b, "name")?;
     let rtype = b.get("type").and_then(Value::as_str).unwrap_or("public");
     let existing: Option<String> = conn
-        .query_row("SELECT owner FROM rooms WHERE name=?1", params![name], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT owner FROM rooms WHERE name=?1",
+            params![name],
+            |r| r.get(0),
+        )
         .optional()
         .unwrap();
     if let Some(owner) = existing {
@@ -436,9 +453,12 @@ fn op_destroy_room(conn: &Connection, agent: &str, b: &Value) -> OpResult {
     if owner != agent {
         return Result::Err(err(403, format!("not owner of {room:?} (owner {owner:?})")));
     }
-    conn.execute("DELETE FROM rooms WHERE name=?1", params![room]).unwrap();
-    conn.execute("DELETE FROM members WHERE room=?1", params![room]).unwrap();
-    conn.execute("DELETE FROM messages WHERE room_key=?1", params![room]).unwrap();
+    conn.execute("DELETE FROM rooms WHERE name=?1", params![room])
+        .unwrap();
+    conn.execute("DELETE FROM members WHERE room=?1", params![room])
+        .unwrap();
+    conn.execute("DELETE FROM messages WHERE room_key=?1", params![room])
+        .unwrap();
     Ok(json!({ "ok": true, "destroyed": room }))
 }
 
@@ -517,7 +537,9 @@ fn op_kick(conn: &Connection, agent: &str, b: &Value) -> OpResult {
 /// list once the timeout elapses. Never holds the DB lock while parked.
 fn op_wait(state: &State, agent: &str, b: &Value) -> OpResult {
     let room = need(b, "room")?.to_string();
-    let secs = opt_i64(b, "timeout").filter(|t| *t > 0).unwrap_or(DEFAULT_WAIT_SECS as i64) as u64;
+    let secs = opt_i64(b, "timeout")
+        .filter(|t| *t > 0)
+        .unwrap_or(DEFAULT_WAIT_SECS as i64) as u64;
     let deadline = Instant::now() + Duration::from_secs(secs);
     let fixed_since = opt_i64(b, "since");
 
@@ -594,7 +616,7 @@ pub fn selfcheck() -> Result<(), String> {
         let mut resp = String::new();
         s.read_to_string(&mut resp).unwrap();
         let code = resp.split_whitespace().nth(1).unwrap().parse().unwrap();
-        let body = resp.splitn(2, "\r\n\r\n").nth(1).unwrap_or("");
+        let body = resp.split_once("\r\n\r\n").map_or("", |x| x.1);
         (code, serde_json::from_str(body).unwrap_or(Value::Null))
     };
     macro_rules! check {
@@ -606,13 +628,19 @@ pub fn selfcheck() -> Result<(), String> {
     }
 
     // auth
-    check!(call("rooms", "a", "wrong", json!({})).0 == 401, "bad token must 401");
+    check!(
+        call("rooms", "a", "wrong", json!({})).0 == 401,
+        "bad token must 401"
+    );
     // register + room + send + read roundtrip
     check!(
         call("create-room", "alice", token, json!({"name":"r"})).1["owner"] == "alice",
         "create-room owner"
     );
-    check!(call("join", "bob", token, json!({"room":"r"})).0 == 200, "join");
+    check!(
+        call("join", "bob", token, json!({"room":"r"})).0 == 200,
+        "join"
+    );
     check!(
         call("send", "alice", token, json!({"room":"r","text":"hi"})).1["ok"] == true,
         "send"
@@ -642,7 +670,10 @@ pub fn selfcheck() -> Result<(), String> {
             .is_empty(),
         "non-member empty inbox"
     );
-    check!(call("join", "carol", token, json!({"room":"r"})).0 == 200, "carol join");
+    check!(
+        call("join", "carol", token, json!({"room":"r"})).0 == 200,
+        "carol join"
+    );
     check!(
         call("inbox", "carol", token, json!({})).1["inbox"][0]["unread"] == 2,
         "fresh joiner sees backlog"
@@ -669,8 +700,7 @@ pub fn selfcheck() -> Result<(), String> {
         "owner destroy"
     );
     check!(
-        call("rooms", "alice", token, json!({}))
-            .1["rooms"]
+        call("rooms", "alice", token, json!({})).1["rooms"]
             .as_array()
             .unwrap()
             .iter()
@@ -763,9 +793,12 @@ mod tests {
         s.write_all(req.as_bytes()).unwrap();
         let mut resp = String::new();
         s.read_to_string(&mut resp).unwrap();
-        let body = resp.splitn(2, "\r\n\r\n").nth(1).unwrap();
+        let body = resp.split_once("\r\n\r\n").unwrap().1;
         let doc: Value = serde_json::from_str(body).unwrap();
         assert_eq!(doc["messages"][0]["text"], "wakeup");
-        assert!(start.elapsed() < Duration::from_secs(5), "wait should wake fast");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "wait should wake fast"
+        );
     }
 }
