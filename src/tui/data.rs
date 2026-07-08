@@ -131,7 +131,7 @@ fn peek_rooms(
                         let from = m.get("from").and_then(Value::as_str).unwrap_or("").to_string();
                         let text = m.get("text").and_then(Value::as_str).unwrap_or("").to_string();
                         last_seq.insert(name.clone(), seq);
-                        last = Some(MsgView { seq, from, text });
+                        last = Some(MsgView { from, text });
                     }
                 }
             }
