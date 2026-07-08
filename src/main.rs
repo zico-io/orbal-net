@@ -23,6 +23,10 @@
 //!   comms read <room> [--since <seq>]
 //!   comms wait <room> [--since <seq>] [--timeout <secs>]   # blocking long-poll read
 //!   comms invite <room> <agent> | kick <room> <agent>
+//!   comms event <room> <kind> [--task T] [--phase P] [--step N/M] [--percent P]
+//!               [--to AGENT] [--note <text...>]            # emit a progress event
+//!   comms progress <room> <N/M | P%> [--task T] [--note <text...>]  # sugar for `event step`
+//!   comms events <room> [--since <seq>]                     # non-consuming event read
 
 #![warn(clippy::all)]
 
@@ -48,6 +52,10 @@ comms <subcommand> [args]
   peek <room> [--since <seq>]   # read without advancing your cursor (monitoring)
   wait <room> [--since <seq>] [--timeout <secs>]
   invite <room> <agent> | kick <room> <agent>
+  event <room> <kind> [--task T] [--phase P] [--step N/M] [--percent P] [--to AGENT] [--note <text...>]
+    kinds: task-start | task-done | task-error | task-abort | step | phase | blocked | handoff
+  progress <room> <N/M | P%> [--task T] [--note <text...>]   # sugar for `event step`
+  events <room> [--since <seq>]   # non-consuming event read
   tui [--interval <secs>]   # live full-screen dashboard (alias: watch)";
 
 fn die(msg: impl AsRef<str>) -> ! {
@@ -87,8 +95,35 @@ fn parse_opt(args: &[String], name: &str) -> (Option<String>, Vec<String>) {
     }
 }
 
+/// Split `--note <text...>` off the end of args: everything after `--note` is
+/// joined with spaces as the note text (mirrors how `send`/`dm` take a trailing
+/// message), leaving the flag args before it for `parse_opt` to consume.
+fn split_note(args: &[String]) -> (Vec<String>, Option<String>) {
+    match args.iter().position(|a| a == "--note") {
+        Some(i) => (args[..i].to_vec(), Some(args[i + 1..].join(" "))),
+        None => (args.to_vec(), None),
+    }
+}
+
+/// Parse a `--step N/M` value into (step_cur, step_total).
+fn parse_step(s: &str) -> (i64, i64) {
+    let (cur, total) = s
+        .split_once('/')
+        .unwrap_or_else(|| die(format!("bad --step value {s:?}; want N/M")));
+    let cur: i64 = cur
+        .parse()
+        .unwrap_or_else(|_| die(format!("bad --step value {s:?}; want N/M")));
+    let total: i64 = total
+        .parse()
+        .unwrap_or_else(|_| die(format!("bad --step value {s:?}; want N/M")));
+    (cur, total)
+}
+
 fn client(argv: &[String]) {
     let cmd = argv[0].as_str();
+    // `progress` is pure client-side sugar for `event` (kind=step): same wire
+    // action, no server-side "progress" verb.
+    let wire_action = if cmd == "progress" { "event" } else { cmd };
     let rest: Vec<String> = argv[1..].to_vec();
 
     // (action, body-fields, is_wait) — body always gets "agent" added by post().
@@ -169,6 +204,80 @@ fn client(argv: &[String]) {
             body.insert("room".into(), json!(rest[0]));
             body.insert("target".into(), json!(rest[1]));
         }
+        "event" => {
+            // --note takes the rest of argv (like send/dm), so split it off first.
+            let (rest, note) = split_note(&rest);
+            let (task, rest) = parse_opt(&rest, "--task");
+            let (phase, rest) = parse_opt(&rest, "--phase");
+            let (step, rest) = parse_opt(&rest, "--step");
+            let (percent, rest) = parse_opt(&rest, "--percent");
+            let (to, rest) = parse_opt(&rest, "--to");
+            if rest.len() != 2 {
+                die("usage: comms event <room> <kind> [--task T] [--phase P] [--step N/M] [--percent P] [--to AGENT] [--note <text...>]");
+            }
+            body.insert("room".into(), json!(rest[0]));
+            body.insert("kind".into(), json!(rest[1]));
+            if let Some(t) = task {
+                body.insert("task".into(), json!(t));
+            }
+            if let Some(p) = phase {
+                body.insert("phase".into(), json!(p));
+            }
+            if let Some(s) = step {
+                let (cur, total) = parse_step(&s);
+                body.insert("step_cur".into(), json!(cur));
+                body.insert("step_total".into(), json!(total));
+            }
+            if let Some(p) = percent {
+                let p: i64 = p
+                    .trim_end_matches('%')
+                    .parse()
+                    .unwrap_or_else(|_| die(format!("bad --percent value {p:?}")));
+                body.insert("percent".into(), json!(p));
+            }
+            if let Some(t) = to {
+                body.insert("target".into(), json!(t));
+            }
+            if let Some(n) = note {
+                body.insert("note".into(), json!(n));
+            }
+        }
+        "progress" => {
+            let (rest, note) = split_note(&rest);
+            let (task, rest) = parse_opt(&rest, "--task");
+            if rest.len() != 2 {
+                die("usage: comms progress <room> <N/M | P%> [--task T] [--note <text...>]");
+            }
+            body.insert("room".into(), json!(rest[0]));
+            body.insert("kind".into(), json!("step"));
+            if rest[1].ends_with('%') {
+                let p: i64 = rest[1]
+                    .trim_end_matches('%')
+                    .parse()
+                    .unwrap_or_else(|_| die(format!("bad progress value {:?}", rest[1])));
+                body.insert("percent".into(), json!(p));
+            } else {
+                let (cur, total) = parse_step(&rest[1]);
+                body.insert("step_cur".into(), json!(cur));
+                body.insert("step_total".into(), json!(total));
+            }
+            if let Some(t) = task {
+                body.insert("task".into(), json!(t));
+            }
+            if let Some(n) = note {
+                body.insert("note".into(), json!(n));
+            }
+        }
+        "events" => {
+            let (since, rest) = parse_opt(&rest, "--since");
+            if rest.len() != 1 {
+                die("usage: comms events <room> [--since <seq>]");
+            }
+            body.insert("room".into(), json!(rest[0]));
+            if let Some(s) = since {
+                body.insert("since".into(), json!(s));
+            }
+        }
         other => die(format!(
             "unknown command {other:?} (see comms with no args)"
         )),
@@ -192,7 +301,7 @@ fn client(argv: &[String]) {
         Duration::from_secs(30)
     };
 
-    match http_post(&url, &token, cmd, &payload, read_timeout) {
+    match http_post(&url, &token, wire_action, &payload, read_timeout) {
         Ok((code, body)) => {
             let doc: Value = serde_json::from_str(&body).unwrap_or(json!({ "raw": body }));
             if code == 200 {

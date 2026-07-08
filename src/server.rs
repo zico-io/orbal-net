@@ -9,11 +9,31 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tiny_http::{Header, Response, Server};
 
 pub const STATES: [&str; 4] = ["active", "idle", "busy", "done"];
 const DEFAULT_WAIT_SECS: u64 = 120;
+
+/// The 8-kind progress-event vocabulary (contract v1). Each kind names its one
+/// required field (checked in `op_event`); everything else is optional.
+const EVENT_KINDS: [&str; 8] = [
+    "task-start",
+    "task-done",
+    "task-error",
+    "task-abort",
+    "step",
+    "phase",
+    "blocked",
+    "handoff",
+];
+
+fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
 
 /// An error to return to the client as `{code} {"error": msg}`.
 #[derive(Debug)]
@@ -112,9 +132,35 @@ fn init_schema(conn: &Connection) {
          CREATE INDEX IF NOT EXISTS idx_messages_room ON messages(room_key, seq);
          CREATE TABLE IF NOT EXISTS cursors(
            agent TEXT NOT NULL, room_key TEXT NOT NULL, seq INTEGER NOT NULL,
-           PRIMARY KEY(agent, room_key));",
+           PRIMARY KEY(agent, room_key));
+         CREATE TABLE IF NOT EXISTS events(
+           seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+           room_key   TEXT NOT NULL,
+           agent      TEXT NOT NULL,
+           kind       TEXT NOT NULL,
+           task       TEXT,
+           phase      TEXT,
+           step_cur   INTEGER,
+           step_total INTEGER,
+           percent    INTEGER,
+           target     TEXT,
+           note       TEXT,
+           ts         INTEGER NOT NULL);
+         CREATE INDEX IF NOT EXISTS idx_events_room ON events(room_key, seq);",
     )
     .expect("init schema");
+
+    // Migration: older databases have a `messages` table with no `ts` column.
+    // Additive-only (existing rows keep ts = NULL) so a pre-existing comms.db
+    // opens unchanged.
+    let has_ts: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name='ts'")
+        .and_then(|mut s| s.exists([]))
+        .unwrap_or(false);
+    if !has_ts {
+        conn.execute_batch("ALTER TABLE messages ADD COLUMN ts INTEGER;")
+            .expect("migrate messages.ts");
+    }
 }
 
 fn handle(state: &State, mut request: tiny_http::Request) {
@@ -183,6 +229,8 @@ fn dispatch(conn: &Connection, action: &str, agent: &str, b: &Value) -> OpResult
         "inbox" => op_inbox(conn, agent),
         "invite" => op_invite(conn, agent, b),
         "kick" => op_kick(conn, agent, b),
+        "event" => op_event(conn, agent, b),
+        "events" => op_events(conn, agent, b),
         other => Result::Err(err(404, format!("unknown action {other:?}"))),
     }
 }
@@ -269,10 +317,13 @@ fn cursor(conn: &Connection, agent: &str, room_key: &str) -> i64 {
     .unwrap_or(0)
 }
 
-/// Messages in `room_key` with seq > `since`, as `[{seq, from, text}]`.
+/// Messages in `room_key` with seq > `since`, as `[{seq, from, text, ts}]`. `ts` is
+/// `null` for rows written before the ts migration.
 fn messages_after(conn: &Connection, room_key: &str, since: i64) -> Vec<Value> {
     let mut stmt = conn
-        .prepare("SELECT seq, sender, text FROM messages WHERE room_key=?1 AND seq>?2 ORDER BY seq")
+        .prepare(
+            "SELECT seq, sender, text, ts FROM messages WHERE room_key=?1 AND seq>?2 ORDER BY seq",
+        )
         .expect("prepare messages");
     let rows = stmt
         .query_map(params![room_key, since], |r| {
@@ -280,6 +331,7 @@ fn messages_after(conn: &Connection, room_key: &str, since: i64) -> Vec<Value> {
                 "seq": r.get::<_, i64>(0)?,
                 "from": r.get::<_, String>(1)?,
                 "text": r.get::<_, String>(2)?,
+                "ts": r.get::<_, Option<i64>>(3)?,
             }))
         })
         .expect("query messages");
@@ -297,8 +349,8 @@ fn advance_cursor(conn: &Connection, agent: &str, room_key: &str, seq: i64) {
 
 fn append(conn: &Connection, room_key: &str, sender: &str, text: &str) -> i64 {
     conn.execute(
-        "INSERT INTO messages(room_key, sender, text) VALUES(?1,?2,?3)",
-        params![room_key, sender, text],
+        "INSERT INTO messages(room_key, sender, text, ts) VALUES(?1,?2,?3,?4)",
+        params![room_key, sender, text, now_millis()],
     )
     .expect("insert message");
     conn.last_insert_rowid()
@@ -538,6 +590,117 @@ fn op_kick(conn: &Connection, agent: &str, b: &Value) -> OpResult {
     Ok(json!({ "ok": true, "room": room, "kicked": target }))
 }
 
+/// The field each event kind requires (contract v1 section 3); other fields stay
+/// optional. `step` accepts either step_cur/step_total or percent (or both).
+fn required_field(kind: &str) -> &'static str {
+    match kind {
+        "task-start" | "task-done" | "task-error" | "task-abort" => "task",
+        "phase" => "phase",
+        "blocked" => "target",
+        "handoff" => "target",
+        _ => "",
+    }
+}
+
+fn op_event(conn: &Connection, agent: &str, b: &Value) -> OpResult {
+    let room = need(b, "room")?;
+    let kind = need(b, "kind")?;
+    if !EVENT_KINDS.contains(&kind) {
+        return Result::Err(err(
+            400,
+            format!("bad kind {kind:?}; want one of {EVENT_KINDS:?}"),
+        ));
+    }
+    room_owner(conn, room)?; // 404 if the room does not exist
+
+    let task = b.get("task").and_then(Value::as_str);
+    let phase = b.get("phase").and_then(Value::as_str);
+    let target = b.get("target").and_then(Value::as_str);
+    let step_cur = opt_i64(b, "step_cur");
+    let step_total = opt_i64(b, "step_total");
+    let percent = opt_i64(b, "percent");
+    let note = b.get("note").and_then(Value::as_str);
+
+    if kind == "step" && step_cur.is_none() && step_total.is_none() && percent.is_none() {
+        return Result::Err(err(
+            400,
+            "kind \"step\" needs step_cur/step_total or percent",
+        ));
+    }
+    let req = required_field(kind);
+    if !req.is_empty() {
+        let present = match req {
+            "task" => task.is_some(),
+            "phase" => phase.is_some(),
+            "target" => target.is_some(),
+            _ => true,
+        };
+        if !present {
+            return Result::Err(err(400, format!("kind {kind:?} needs field {req:?}")));
+        }
+    }
+
+    let ts = now_millis();
+    conn.execute(
+        "INSERT INTO events(room_key, agent, kind, task, phase, step_cur, step_total, percent, target, note, ts)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+        params![room, agent, kind, task, phase, step_cur, step_total, percent, target, note, ts],
+    )
+    .expect("insert event");
+    let seq = conn.last_insert_rowid();
+    Ok(json!({ "ok": true, "seq": seq, "ts": ts }))
+}
+
+/// Non-consuming read of events, always by `since` against the global `events.seq`
+/// (no cursor concept for events, ever). `room` narrows to one room's thread;
+/// omitted, it returns across all rooms (for the progress panel's one poll/cycle).
+fn op_events(conn: &Connection, _agent: &str, b: &Value) -> OpResult {
+    let since = opt_i64(b, "since").unwrap_or(0);
+    let room = b.get("room").and_then(Value::as_str);
+
+    let row_to_json = |r: &rusqlite::Row| -> rusqlite::Result<Value> {
+        Ok(json!({
+            "seq": r.get::<_, i64>(0)?,
+            "room": r.get::<_, String>(1)?,
+            "agent": r.get::<_, String>(2)?,
+            "kind": r.get::<_, String>(3)?,
+            "task": r.get::<_, Option<String>>(4)?,
+            "phase": r.get::<_, Option<String>>(5)?,
+            "step_cur": r.get::<_, Option<i64>>(6)?,
+            "step_total": r.get::<_, Option<i64>>(7)?,
+            "percent": r.get::<_, Option<i64>>(8)?,
+            "target": r.get::<_, Option<String>>(9)?,
+            "note": r.get::<_, Option<String>>(10)?,
+            "ts": r.get::<_, i64>(11)?,
+        }))
+    };
+    const COLS: &str =
+        "seq, room_key, agent, kind, task, phase, step_cur, step_total, percent, target, note, ts";
+
+    let events: Vec<Value> = if let Some(room) = room {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {COLS} FROM events WHERE room_key=?1 AND seq>?2 ORDER BY seq"
+            ))
+            .expect("prepare events");
+        stmt.query_map(params![room, since], row_to_json)
+            .expect("query events")
+            .map(|r| r.expect("row"))
+            .collect()
+    } else {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {COLS} FROM events WHERE seq>?1 ORDER BY seq"
+            ))
+            .expect("prepare events");
+        stmt.query_map(params![since], row_to_json)
+            .expect("query events")
+            .map(|r| r.expect("row"))
+            .collect()
+    };
+    Ok(json!({ "events": events }))
+}
+
 /// Blocking read: return as soon as `room` has a message past the cursor, or an empty
 /// list once the timeout elapses. Never holds the DB lock while parked.
 fn op_wait(state: &State, agent: &str, b: &Value) -> OpResult {
@@ -695,6 +858,105 @@ pub fn selfcheck() -> Result<(), String> {
             .is_empty(),
         "bob sees DM"
     );
+    // events: emit each kind, non-consuming read, bad-kind/missing-field rejection
+    check!(
+        call(
+            "event",
+            "alice",
+            token,
+            json!({"room":"r","kind":"task-start","task":"build"})
+        )
+        .1["ok"]
+            == true,
+        "event task-start"
+    );
+    check!(
+        call(
+            "event",
+            "alice",
+            token,
+            json!({"room":"r","kind":"step","step_cur":3,"step_total":8})
+        )
+        .1["ok"]
+            == true,
+        "event step"
+    );
+    check!(
+        call(
+            "event",
+            "alice",
+            token,
+            json!({"room":"r","kind":"phase","phase":"compiling"})
+        )
+        .1["ok"]
+            == true,
+        "event phase"
+    );
+    check!(
+        call(
+            "event",
+            "alice",
+            token,
+            json!({"room":"r","kind":"blocked","target":"host"})
+        )
+        .1["ok"]
+            == true,
+        "event blocked"
+    );
+    check!(
+        call(
+            "event",
+            "alice",
+            token,
+            json!({"room":"r","kind":"task-done","task":"build"})
+        )
+        .1["ok"]
+            == true,
+        "event task-done"
+    );
+    check!(
+        call(
+            "event",
+            "alice",
+            token,
+            json!({"room":"r","kind":"nonsense"})
+        )
+        .0 == 400,
+        "bad kind rejected"
+    );
+    check!(
+        call(
+            "event",
+            "alice",
+            token,
+            json!({"room":"r","kind":"task-start"})
+        )
+        .0 == 400,
+        "missing required field rejected"
+    );
+    let (code, doc) = call("events", "bob", token, json!({"room":"r","since":0}));
+    check!(
+        code == 200 && doc["events"].as_array().unwrap().len() == 5,
+        "events read sees all 5"
+    );
+    // events read is non-consuming: same since=0 read again sees the same 5
+    check!(
+        call("events", "bob", token, json!({"room":"r","since":0})).1["events"]
+            .as_array()
+            .unwrap()
+            .len()
+            == 5,
+        "events read is non-consuming"
+    );
+    // room-omitted events read spans all rooms
+    check!(
+        call("events", "bob", token, json!({"since":0})).1["events"]
+            .as_array()
+            .unwrap()
+            .len()
+            >= 5,
+        "events read across all rooms"
+    );
     // owner-only destroy
     check!(
         call("destroy-room", "bob", token, json!({"room":"r"})).0 == 403,
@@ -744,6 +1006,62 @@ mod tests {
             assert_eq!(rooms["rooms"][0]["name"], "r");
             let read = op_read(&conn, "bob", &json!({"room":"r"})).unwrap();
             assert_eq!(read["messages"][0]["text"], "persisted");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn migration_adds_ts_to_old_schema_db() {
+        let path = std::env::temp_dir().join("comms_test_migrate.db");
+        let _ = std::fs::remove_file(&path);
+        // Build a pre-migration db by hand: the old schema, no `events` table, no
+        // `ts` column on `messages`, with a real row already in it.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE agents(id TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT 'active');
+                 CREATE TABLE rooms(name TEXT PRIMARY KEY, owner TEXT NOT NULL, type TEXT NOT NULL DEFAULT 'public');
+                 CREATE TABLE members(room TEXT NOT NULL, agent TEXT NOT NULL, PRIMARY KEY(room, agent));
+                 CREATE TABLE messages(seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                   room_key TEXT NOT NULL, sender TEXT NOT NULL, text TEXT NOT NULL);
+                 CREATE TABLE cursors(agent TEXT NOT NULL, room_key TEXT NOT NULL, seq INTEGER NOT NULL,
+                   PRIMARY KEY(agent, room_key));
+                 INSERT INTO rooms(name, owner) VALUES('r', 'alice');
+                 INSERT INTO members(room, agent) VALUES('r', 'alice');
+                 INSERT INTO messages(room_key, sender, text) VALUES('r', 'alice', 'before migration');",
+            )
+            .unwrap();
+        }
+        // Reopening runs init_schema, which must migrate this db in place: add
+        // messages.ts (existing row -> NULL) and create the events table, without
+        // touching the pre-existing row's data.
+        {
+            let conn = Connection::open(&path).unwrap();
+            init_schema(&conn);
+            let read = op_read(
+                &conn,
+                "bob",
+                &json!({"room": "r", "since": 0, "peek": true}),
+            )
+            .unwrap();
+            assert_eq!(read["messages"][0]["text"], "before migration");
+            assert!(
+                read["messages"][0]["ts"].is_null(),
+                "legacy row keeps ts=null"
+            );
+
+            // events table exists and a fresh event can be written and read back.
+            op_join(&conn, "bob", &json!({"room": "r"})).unwrap();
+            let posted = op_event(
+                &conn,
+                "alice",
+                &json!({"room":"r","kind":"phase","phase":"migrated"}),
+            )
+            .unwrap();
+            assert_eq!(posted["ok"], true);
+            assert!(posted["ts"].as_i64().unwrap() > 0);
+            let events = op_events(&conn, "bob", &json!({"room":"r","since":0})).unwrap();
+            assert_eq!(events["events"][0]["phase"], "migrated");
         }
         let _ = std::fs::remove_file(&path);
     }
