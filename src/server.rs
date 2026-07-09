@@ -17,7 +17,11 @@ pub const STATES: [&str; 4] = ["active", "idle", "busy", "done"];
 /// SSE keepalive cadence: a `: keepalive` comment every ~20s of idle, purely to keep
 /// proxies/clients from timing out the connection. Never a correctness backstop —
 /// delivery is notify-driven; this timer only decides when to write a no-op comment.
+/// Shortened under `cfg(test)` so `stream_emits_keepalive_on_idle` doesn't take 20s.
+#[cfg(not(test))]
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
+#[cfg(test)]
+const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(200);
 
 /// The 8-kind progress-event vocabulary (contract v1). Each kind names its one
 /// required field (checked in `op_event`); everything else is optional.
@@ -1691,5 +1695,78 @@ mod tests {
         // monitor never advances bob's read cursor: bob's own recv/read still sees "hi".
         let unread = post(port, token, "read", "bob", json!({"room":"r","peek":true}));
         assert_eq!(unread["messages"][0]["text"], "hi");
+    }
+
+    /// Backfill/live boundary race: fire sends concurrently with the stream connecting
+    /// (some may land before the backfill snapshot, some after, some right on the
+    /// boundary). Every message must be delivered exactly once regardless of which
+    /// side of `: ready` it fell on — never missed, never duplicated.
+    #[test]
+    fn stream_connect_send_race_exactly_once() {
+        let token = "t";
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn);
+        op_create_room(&conn, "alice", &json!({"name":"r"})).unwrap();
+        op_join(&conn, "bob", &json!({"room":"r"})).unwrap();
+        let (_state, port) = spawn_test_server(conn, token);
+
+        const N: i64 = 20;
+        let sender = std::thread::spawn(move || {
+            for i in 0..N {
+                post(
+                    port,
+                    token,
+                    "send",
+                    "alice",
+                    json!({"room":"r","text": format!("race{i}")}),
+                );
+            }
+        });
+
+        let mut client =
+            SseClient::connect(port, token, json!({"agent":"bob","mode":"recv","room":"r"}));
+        let mut seen = std::collections::HashSet::new();
+        for (_, _, d) in client.backfill() {
+            assert!(
+                seen.insert(d["seq"].as_i64().unwrap()),
+                "duplicate seq in backfill: {d}"
+            );
+        }
+        while (seen.len() as i64) < N {
+            let (_, _, d) = client.next_frame();
+            assert!(
+                seen.insert(d["seq"].as_i64().unwrap()),
+                "duplicate seq live: {d}"
+            );
+        }
+        sender.join().unwrap();
+
+        let mut seqs: Vec<i64> = seen.into_iter().collect();
+        seqs.sort();
+        assert_eq!(seqs, (1..=N).collect::<Vec<_>>(), "exactly-once, no gaps");
+    }
+
+    /// Idle connections get a `: keepalive` comment on the configured cadence (proxy
+    /// liveness only — never a delivery backstop; delivery correctness is covered by
+    /// the notify-driven tests above).
+    #[test]
+    fn stream_emits_keepalive_on_idle() {
+        let token = "t";
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn);
+        op_create_room(&conn, "alice", &json!({"name":"r"})).unwrap();
+        op_join(&conn, "bob", &json!({"room":"r"})).unwrap();
+        let (_state, port) = spawn_test_server(conn, token);
+
+        let mut client =
+            SseClient::connect(port, token, json!({"agent":"bob","mode":"recv","room":"r"}));
+        assert!(client.backfill().is_empty());
+
+        let text = client.next_chunk();
+        assert_eq!(
+            text.trim(),
+            ": keepalive",
+            "idle stream must emit keepalive"
+        );
     }
 }
