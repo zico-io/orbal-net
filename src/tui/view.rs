@@ -19,7 +19,9 @@
 //! data.rs's job; `focus` is the one-way channel by which drilling into a room
 //! asks data.rs to start fetching that room's full thread (see mod.rs::FocusHandle).
 
-use super::{AgentView, Config, EventView, FocusHandle, Health, RoomThread, RoomView, Snapshot, ThreadItem};
+use super::{
+    AgentView, Config, EventView, FocusHandle, Health, RoomThread, RoomView, Snapshot, ThreadItem,
+};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -104,7 +106,8 @@ impl ViewState {
     }
 
     fn scroll_thread_up(&mut self) {
-        self.thread_backscroll = (self.thread_backscroll + 1).min(self.thread_len.saturating_sub(1));
+        self.thread_backscroll =
+            (self.thread_backscroll + 1).min(self.thread_len.saturating_sub(1));
     }
 
     fn scroll_thread_down(&mut self) {
@@ -222,7 +225,13 @@ fn draw(f: &mut Frame, cfg: &Config, snap: &Snapshot, state: &ViewState) {
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
             .split(chunks[1]);
-        draw_thread(f, body[0], room, snap.thread.as_ref(), state.thread_backscroll);
+        draw_thread(
+            f,
+            body[0],
+            room,
+            snap.thread.as_ref(),
+            state.thread_backscroll,
+        );
         draw_progress(f, body[1], snap);
     } else {
         let body = Layout::default()
@@ -390,7 +399,13 @@ fn draw_footer(f: &mut Frame, area: Rect, focused: bool) {
 
 // --- drill-in thread ---------------------------------------------------------
 
-fn draw_thread(f: &mut Frame, area: Rect, room: &str, thread: Option<&RoomThread>, backscroll: usize) {
+fn draw_thread(
+    f: &mut Frame,
+    area: Rect,
+    room: &str,
+    thread: Option<&RoomThread>,
+    backscroll: usize,
+) {
     let title = format!("thread: {room}");
     let block = Block::default().borders(Borders::ALL).title(title);
 
@@ -419,15 +434,23 @@ fn draw_thread(f: &mut Frame, area: Rect, room: &str, thread: Option<&RoomThread
     let visible = &items[start..end];
 
     let lines: Vec<Line> = visible.iter().map(thread_item_line).collect();
-    let body = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    let body = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     f.render_widget(body, area);
 }
 
 fn thread_item_line(item: &ThreadItem) -> Line<'static> {
     match item {
         ThreadItem::Msg(m) => Line::from(vec![
-            Span::styled(format!("{}  ", fmt_time(m.ts)), Style::default().fg(Color::DarkGray)),
-            Span::styled(format!("{}: ", m.from), Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{}  ", fmt_time(m.ts)),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                format!("{}: ", m.from),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
             Span::raw(m.text.clone()),
         ]),
         ThreadItem::Evt(e) => {
@@ -439,7 +462,10 @@ fn thread_item_line(item: &ThreadItem) -> Line<'static> {
                 format!("{}: {}", e.agent, detail)
             };
             Line::from(vec![
-                Span::styled(format!("{}  ", fmt_time(Some(e.ts))), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}  ", fmt_time(Some(e.ts))),
+                    Style::default().fg(Color::DarkGray),
+                ),
                 Span::styled(
                     format!("[{}] ", event_tag(e)),
                     Style::default().fg(color).add_modifier(Modifier::BOLD),

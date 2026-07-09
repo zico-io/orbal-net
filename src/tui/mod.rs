@@ -249,7 +249,12 @@ pub fn run(args: &[String]) {
         std::thread::spawn(move || data::run(&cfg, shared, stop, focus))
     };
 
-    let result = view::run(&cfg, Arc::clone(&shared), Arc::clone(&stop), Arc::clone(&focus));
+    let result = view::run(
+        &cfg,
+        Arc::clone(&shared),
+        Arc::clone(&stop),
+        Arc::clone(&focus),
+    );
 
     // Ensure the poller unwinds even if the view returned on its own.
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
