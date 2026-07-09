@@ -1,19 +1,23 @@
 //! The `orbal-net serve` server: SQLite-backed store + threaded JSON-over-HTTP handler.
 //!
 //! One `rusqlite::Connection` behind a Mutex is the whole coordination store (the 1:1
-//! analog of the previous single `threading.Lock`). A Condvar lets `wait` block until a
-//! message lands instead of the client hot-polling. State lives in SQLite so a mission
-//! server can crash and restart against the same `--db` file without losing history.
+//! analog of the previous single `threading.Lock`). A Condvar wakes any open `/stream`
+//! connection as soon as a message/event/roster change lands, so clients react on
+//! arrival instead of hot-polling. State lives in SQLite so a mission server can crash
+//! and restart against the same `--db` file without losing history.
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, ToSql};
 use serde_json::{json, Value};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tiny_http::{Header, Response, Server};
 
 pub const STATES: [&str; 4] = ["active", "idle", "busy", "done"];
-const DEFAULT_WAIT_SECS: u64 = 120;
+/// SSE keepalive cadence: a `: keepalive` comment every ~20s of idle, purely to keep
+/// proxies/clients from timing out the connection. Never a correctness backstop —
+/// delivery is notify-driven; this timer only decides when to write a no-op comment.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 
 /// The 8-kind progress-event vocabulary (contract v1). Each kind names its one
 /// required field (checked in `op_event`); everything else is optional.
@@ -52,7 +56,8 @@ type OpResult = Result<Value, Err>;
 struct State {
     db: Mutex<Connection>,
     token: String,
-    // Bumped on every send/dm; `wait` parks on the Condvar and re-checks the DB when woken.
+    // Bumped on every send/dm/event and every roster-affecting op; a `/stream`
+    // connection parks on the Condvar between frames and re-checks the DB when woken.
     gen: Mutex<u64>,
     cvar: Condvar,
 }
@@ -108,9 +113,11 @@ pub fn run(args: &[String]) {
         cvar: Condvar::new(),
     });
 
-    // Thread-per-request: a parked `wait` holds its own thread, so it can't stall other
-    // requests. ponytail: unbounded threads bounded by request rate — fine at fleet
-    // scale (a handful of agents); add a pool only past dozens of concurrent waiters.
+    // Thread-per-request: an open `/stream` connection holds its own thread for as long
+    // as the client stays connected, so it can't stall other requests. ponytail:
+    // unbounded threads bounded by concurrent subscribers — fine at mission scale
+    // (single -> low-double-digit agents); past dozens of concurrent streams, swap for
+    // a poll-reactor (mio/epoll) driving many connections off one or few threads.
     for request in server.incoming_requests() {
         let state = Arc::clone(&state);
         std::thread::spawn(move || handle(&state, request));
@@ -191,22 +198,35 @@ fn handle(state: &State, mut request: tiny_http::Request) {
         }
     };
 
-    let result = if action == "wait" {
-        op_wait(state, &agent, &body)
-    } else {
-        let conn = state.db.lock().unwrap();
-        touch(&conn, &agent);
-        let r = dispatch(&conn, &action, &agent, &body);
-        drop(conn);
-        // A committed message wakes any parked waiters.
-        if r.is_ok() && (action == "send" || action == "dm") {
-            *state.gen.lock().unwrap() += 1;
-            state.cvar.notify_all();
-        }
-        r
-    };
+    if action == "stream" {
+        return handle_stream(state, request, agent, body);
+    }
 
-    match result {
+    let conn = state.db.lock().unwrap();
+    touch(&conn, &agent);
+    let r = dispatch(&conn, &action, &agent, &body);
+    drop(conn);
+    // A committed message/event or roster change wakes any parked `/stream` connections.
+    if r.is_ok()
+        && matches!(
+            action.as_str(),
+            "send"
+                | "dm"
+                | "event"
+                | "status"
+                | "join"
+                | "leave"
+                | "create-room"
+                | "destroy-room"
+                | "invite"
+                | "kick"
+        )
+    {
+        *state.gen.lock().unwrap() += 1;
+        state.cvar.notify_all();
+    }
+
+    match r {
         Ok(v) => reply(request, 200, v),
         Err(e) => reply(request, e.code, json!({ "error": e.msg })),
     }
@@ -338,6 +358,88 @@ fn messages_after(conn: &Connection, room_key: &str, since: i64) -> Vec<Value> {
     rows.map(|r| r.expect("row")).collect()
 }
 
+/// Messages across several room keys with seq > `since`, ordered by seq, each row
+/// tagged with its `room`. Used by `/stream` (a monitor with no `room` filter spans
+/// every relevant room + DM channel in one query).
+fn messages_after_multi(conn: &Connection, room_keys: &[String], since: i64) -> Vec<Value> {
+    if room_keys.is_empty() {
+        return Vec::new();
+    }
+    let placeholders = room_keys.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT seq, room_key, sender, text, ts FROM messages \
+         WHERE room_key IN ({placeholders}) AND seq>? ORDER BY seq"
+    );
+    let mut stmt = conn.prepare(&sql).expect("prepare messages_multi");
+    let mut p: Vec<&dyn ToSql> = room_keys.iter().map(|k| k as &dyn ToSql).collect();
+    p.push(&since);
+    let rows = stmt
+        .query_map(p.as_slice(), |r| {
+            Ok(json!({
+                "seq": r.get::<_, i64>(0)?,
+                "room": r.get::<_, String>(1)?,
+                "from": r.get::<_, String>(2)?,
+                "text": r.get::<_, String>(3)?,
+                "ts": r.get::<_, Option<i64>>(4)?,
+            }))
+        })
+        .expect("query messages_multi");
+    rows.map(|r| r.expect("row")).collect()
+}
+
+/// Events across several room keys with seq > `since`, ordered by seq. Mirrors
+/// `op_events`' row shape but scoped to a room set instead of one room or the globe.
+fn events_after_multi(conn: &Connection, room_keys: &[String], since: i64) -> Vec<Value> {
+    if room_keys.is_empty() {
+        return Vec::new();
+    }
+    let placeholders = room_keys.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT seq, room_key, agent, kind, task, phase, step_cur, step_total, percent, target, note, ts \
+         FROM events WHERE room_key IN ({placeholders}) AND seq>? ORDER BY seq"
+    );
+    let mut stmt = conn.prepare(&sql).expect("prepare events_multi");
+    let mut p: Vec<&dyn ToSql> = room_keys.iter().map(|k| k as &dyn ToSql).collect();
+    p.push(&since);
+    let rows = stmt
+        .query_map(p.as_slice(), |r| {
+            Ok(json!({
+                "seq": r.get::<_, i64>(0)?,
+                "room": r.get::<_, String>(1)?,
+                "agent": r.get::<_, String>(2)?,
+                "kind": r.get::<_, String>(3)?,
+                "task": r.get::<_, Option<String>>(4)?,
+                "phase": r.get::<_, Option<String>>(5)?,
+                "step_cur": r.get::<_, Option<i64>>(6)?,
+                "step_total": r.get::<_, Option<i64>>(7)?,
+                "percent": r.get::<_, Option<i64>>(8)?,
+                "target": r.get::<_, Option<String>>(9)?,
+                "note": r.get::<_, Option<String>>(10)?,
+                "ts": r.get::<_, i64>(11)?,
+            }))
+        })
+        .expect("query events_multi");
+    rows.map(|r| r.expect("row")).collect()
+}
+
+/// Global max `events.seq`, used only as the default pass-through evt-side of a
+/// `recv` stream's composite cursor (recv never backfills or delivers events).
+fn max_event_seq_global(conn: &Connection) -> i64 {
+    conn.query_row("SELECT COALESCE(MAX(seq),0) FROM events", [], |r| r.get(0))
+        .unwrap_or(0)
+}
+
+/// `{agents, rooms}` snapshot sent as the monitor-mode `roster` frame.
+fn roster_snapshot(conn: &Connection) -> Value {
+    let agents = op_agents(conn)
+        .map(|v| v["agents"].clone())
+        .unwrap_or_else(|_| json!([]));
+    let rooms = op_rooms(conn)
+        .map(|v| v["rooms"].clone())
+        .unwrap_or_else(|_| json!([]));
+    json!({ "agents": agents, "rooms": rooms })
+}
+
 fn advance_cursor(conn: &Connection, agent: &str, room_key: &str, seq: i64) {
     conn.execute(
         "INSERT INTO cursors(agent, room_key, seq) VALUES(?1,?2,?3)
@@ -377,6 +479,15 @@ fn relevant_rooms(conn: &Connection, agent: &str) -> Vec<String> {
         }
     }
     keys
+}
+
+/// Room-key scope for a `/stream` connection: the explicit `room` if given, else
+/// every room the agent is a member of plus its DM channels (same set `inbox` uses).
+fn stream_scope(conn: &Connection, agent: &str, room: &Option<String>) -> Vec<String> {
+    match room {
+        Some(r) => vec![r.clone()],
+        None => relevant_rooms(conn, agent),
+    }
 }
 
 // --- ops -------------------------------------------------------------------
@@ -701,37 +812,248 @@ fn op_events(conn: &Connection, _agent: &str, b: &Value) -> OpResult {
     Ok(json!({ "events": events }))
 }
 
-/// Blocking read: return as soon as `room` has a message past the cursor, or an empty
-/// list once the timeout elapses. Never holds the DB lock while parked.
-fn op_wait(state: &State, agent: &str, b: &Value) -> OpResult {
-    let room = need(b, "room")?.to_string();
-    let secs = opt_i64(b, "timeout")
-        .filter(|t| *t > 0)
-        .unwrap_or(DEFAULT_WAIT_SECS as i64) as u64;
-    let deadline = Instant::now() + Duration::from_secs(secs);
-    let fixed_since = opt_i64(b, "since");
+/// Parse a composite Last-Event-ID / `since` cursor `"<msgSeq>:<evtSeq>"`.
+fn parse_since(s: &str) -> Option<(i64, i64)> {
+    let (a, b) = s.split_once(':')?;
+    Some((a.parse().ok()?, b.parse().ok()?))
+}
 
-    loop {
-        {
-            let conn = state.db.lock().unwrap();
-            touch(&conn, agent);
-            let since = fixed_since.unwrap_or_else(|| cursor(&conn, agent, &room));
-            let msgs = messages_after(&conn, &room, since);
-            if let Some(last) = msgs.last() {
-                advance_cursor(&conn, agent, &room, last["seq"].as_i64().unwrap());
-                return Ok(json!({ "room": room, "messages": msgs }));
-            }
-        } // DB lock released before parking
+/// Write one HTTP/1.1 chunk (hex length + CRLF + data + CRLF) and flush immediately.
+/// `/stream` writes straight to the raw connection (via `Request::into_writer`)
+/// instead of going through `Response`/`raw_print`: tiny_http wraps the socket in a
+/// 1KB `BufWriter` and only flushes it when the response finishes, which for an SSE
+/// stream that stays open indefinitely would mean frames sit unflushed. Framing and
+/// flushing by hand here is exactly what a chunked `Response` would do per call, just
+/// with a flush after every chunk instead of one at the end.
+fn write_chunk<W: Write>(writer: &mut W, data: &[u8]) -> io::Result<()> {
+    write!(writer, "{:x}\r\n", data.len())?;
+    writer.write_all(data)?;
+    writer.write_all(b"\r\n")?;
+    writer.flush()
+}
 
-        let now = Instant::now();
-        if now >= deadline {
-            return Ok(json!({ "room": room, "messages": [] }));
+fn write_stream_headers<W: Write>(writer: &mut W) -> io::Result<()> {
+    write!(
+        writer,
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: text/event-stream\r\n\
+         Cache-Control: no-cache\r\n\
+         Connection: keep-alive\r\n\
+         Transfer-Encoding: chunked\r\n\
+         \r\n"
+    )?;
+    writer.flush()
+}
+
+fn write_sse_frame<W: Write>(
+    writer: &mut W,
+    event: &str,
+    id: &str,
+    data: &Value,
+) -> io::Result<()> {
+    write_chunk(
+        writer,
+        format!("event: {event}\nid: {id}\ndata: {data}\n\n").as_bytes(),
+    )
+}
+
+fn write_sse_comment<W: Write>(writer: &mut W, text: &str) -> io::Result<()> {
+    write_chunk(writer, format!(": {text}\n\n").as_bytes())
+}
+
+/// `POST /stream`: a persistent SSE connection, replacing the old poll-based `wait`.
+/// Holds its own thread for the connection's lifetime (see the thread-per-request note
+/// in `run`). `mode: "recv"` is a single-room consuming stream (advances the agent's
+/// read cursor per message, like the old `wait`/`read`, and never emits events).
+/// `mode: "monitor"` is non-consuming, spans a room or every relevant room + DMs, and
+/// also emits `progress` (events) and `roster` (agents/rooms) frames. Resume is via a
+/// composite `"<msgSeq>:<evtSeq>"` cursor (messages.seq and events.seq are independent
+/// autoincrement spaces) taken from the `Last-Event-ID` header or body `since`.
+fn handle_stream(state: &State, request: tiny_http::Request, agent: String, body: Value) {
+    let is_monitor = match body.get("mode").and_then(Value::as_str) {
+        Some("recv") => false,
+        Some("monitor") => true,
+        _ => {
+            return reply(
+                request,
+                400,
+                json!({ "error": "mode must be \"recv\" or \"monitor\"" }),
+            )
         }
-        // Park until a send/dm notifies, with a 2s backstop so a missed notify costs at
-        // most 2s of extra latency (never holds the DB lock, so send() can always run).
-        let wait = (deadline - now).min(Duration::from_secs(2));
+    };
+    let room: Option<String> = body.get("room").and_then(Value::as_str).map(str::to_string);
+    if !is_monitor && room.is_none() {
+        return reply(request, 400, json!({ "error": "recv requires 'room'" }));
+    }
+
+    let since_header = request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Last-Event-ID"))
+        .map(|h| h.value.as_str().to_string());
+    let since_body = body
+        .get("since")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let parsed_since = since_header.or(since_body).as_deref().and_then(parse_since);
+
+    let (mut last_msg, mut last_evt) = {
+        let conn = state.db.lock().unwrap();
+        touch(&conn, &agent);
+        match parsed_since {
+            Some(pair) => pair,
+            None if !is_monitor => (
+                cursor(&conn, &agent, room.as_deref().unwrap()),
+                max_event_seq_global(&conn),
+            ),
+            None => (0, 0),
+        }
+    };
+
+    let mut writer = request.into_writer();
+    if write_stream_headers(&mut writer).is_err() {
+        return;
+    }
+    let mut last_roster: Option<Value> = None;
+
+    // Backfill (since, max] under one DB-lock snapshot, then `: ready`, then go live.
+    // Holding the lock across the whole snapshot+backfill makes it atomic: nothing can
+    // land between "compute the frontier" and "read up to it", so there is no
+    // notify/backfill race to reason about (a notify firing mid-backfill just means the
+    // live loop's first "> last-sent" query re-finds those rows, in-order, exactly once).
+    {
+        let conn = state.db.lock().unwrap();
+        let scope = stream_scope(&conn, &agent, &room);
+        for m in messages_after_multi(&conn, &scope, last_msg) {
+            last_msg = m["seq"].as_i64().unwrap();
+            if write_sse_frame(
+                &mut writer,
+                "message",
+                &format!("{last_msg}:{last_evt}"),
+                &m,
+            )
+            .is_err()
+            {
+                return;
+            }
+            if !is_monitor {
+                advance_cursor(&conn, &agent, room.as_deref().unwrap(), last_msg);
+            }
+        }
+        if is_monitor {
+            for e in events_after_multi(&conn, &scope, last_evt) {
+                last_evt = e["seq"].as_i64().unwrap();
+                if write_sse_frame(
+                    &mut writer,
+                    "progress",
+                    &format!("{last_msg}:{last_evt}"),
+                    &e,
+                )
+                .is_err()
+                {
+                    return;
+                }
+            }
+            let roster = roster_snapshot(&conn);
+            if write_sse_frame(
+                &mut writer,
+                "roster",
+                &format!("{last_msg}:{last_evt}"),
+                &roster,
+            )
+            .is_err()
+            {
+                return;
+            }
+            last_roster = Some(roster);
+        }
+    }
+    if write_sse_comment(&mut writer, "ready").is_err() {
+        return;
+    }
+
+    let mut last_activity = Instant::now();
+    loop {
+        let (msgs, evts, roster_opt) = {
+            let conn = state.db.lock().unwrap();
+            let scope = stream_scope(&conn, &agent, &room);
+            let msgs = messages_after_multi(&conn, &scope, last_msg);
+            let evts = if is_monitor {
+                events_after_multi(&conn, &scope, last_evt)
+            } else {
+                Vec::new()
+            };
+            let roster = if is_monitor {
+                let r = roster_snapshot(&conn);
+                if last_roster.as_ref() != Some(&r) {
+                    Some(r)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            (msgs, evts, roster)
+        };
+
+        let mut wrote = false;
+        for m in &msgs {
+            last_msg = m["seq"].as_i64().unwrap();
+            if write_sse_frame(&mut writer, "message", &format!("{last_msg}:{last_evt}"), m)
+                .is_err()
+            {
+                return;
+            }
+            if !is_monitor {
+                let conn = state.db.lock().unwrap();
+                advance_cursor(&conn, &agent, room.as_deref().unwrap(), last_msg);
+            }
+            wrote = true;
+        }
+        for e in &evts {
+            last_evt = e["seq"].as_i64().unwrap();
+            if write_sse_frame(
+                &mut writer,
+                "progress",
+                &format!("{last_msg}:{last_evt}"),
+                e,
+            )
+            .is_err()
+            {
+                return;
+            }
+            wrote = true;
+        }
+        if let Some(r) = roster_opt {
+            if write_sse_frame(&mut writer, "roster", &format!("{last_msg}:{last_evt}"), &r)
+                .is_err()
+            {
+                return;
+            }
+            last_roster = Some(r);
+            wrote = true;
+        }
+
+        if wrote {
+            last_activity = Instant::now();
+            continue;
+        }
+
+        if last_activity.elapsed() >= KEEPALIVE_INTERVAL {
+            if write_sse_comment(&mut writer, "keepalive").is_err() {
+                return;
+            }
+            last_activity = Instant::now();
+        }
+
+        // Park until notified; re-query "> last-sent" on every wake (notify or
+        // keepalive timeout) rather than trusting the wake reason. Not a correctness
+        // backstop (delivery is notify-driven) — purely what drives the keepalive timer.
+        let remaining = KEEPALIVE_INTERVAL
+            .saturating_sub(last_activity.elapsed())
+            .max(Duration::from_millis(100));
         let guard = state.gen.lock().unwrap();
-        let _ = state.cvar.wait_timeout(guard, wait).unwrap();
+        let _ = state.cvar.wait_timeout(guard, remaining).unwrap();
     }
 }
 
@@ -1066,13 +1388,119 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[test]
-    fn wait_wakes_on_send() {
-        let token = "t";
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn);
-        op_create_room(&conn, "alice", &json!({"name":"r"})).unwrap();
-        op_join(&conn, "bob", &json!({"room":"r"})).unwrap();
+    /// Minimal test-only SSE client: opens `/stream`, decodes HTTP chunked framing by
+    /// hand (no dependency needed for a handful of tests), and hands back parsed
+    /// `(event, id, data)` frames one at a time.
+    struct SseClient {
+        stream: TcpStream,
+        buf: Vec<u8>,
+    }
+
+    impl SseClient {
+        fn connect(port: u16, token: &str, body: Value) -> Self {
+            let payload = body.to_string();
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let req = format!(
+                "POST /stream HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{payload}",
+                payload.len()
+            );
+            stream.write_all(req.as_bytes()).unwrap();
+            let mut me = SseClient {
+                stream,
+                buf: Vec::new(),
+            };
+            me.skip_http_headers();
+            me
+        }
+
+        fn fill(&mut self) {
+            let mut chunk = [0u8; 4096];
+            let n = self.stream.read(&mut chunk).expect("stream read");
+            assert!(n > 0, "stream closed unexpectedly");
+            self.buf.extend_from_slice(&chunk[..n]);
+        }
+
+        fn find(&self, needle: &[u8]) -> Option<usize> {
+            self.buf.windows(needle.len()).position(|w| w == needle)
+        }
+
+        fn skip_http_headers(&mut self) {
+            loop {
+                if let Some(pos) = self.find(b"\r\n\r\n") {
+                    self.buf.drain(..pos + 4);
+                    return;
+                }
+                self.fill();
+            }
+        }
+
+        /// One de-chunked HTTP chunk body as text (an SSE frame or `: comment` line).
+        fn next_chunk(&mut self) -> String {
+            loop {
+                if let Some(pos) = self.find(b"\r\n") {
+                    let len_str = std::str::from_utf8(&self.buf[..pos]).unwrap().trim();
+                    let len = usize::from_str_radix(len_str, 16).expect("chunk len");
+                    let start = pos + 2;
+                    let end = start + len;
+                    if self.buf.len() >= end + 2 {
+                        let text = String::from_utf8(self.buf[start..end].to_vec()).unwrap();
+                        self.buf.drain(..end + 2);
+                        return text;
+                    }
+                }
+                self.fill();
+            }
+        }
+
+        /// Read chunks until `: ready`, returning every `(event, id, data)` frame seen
+        /// during backfill (comments other than `ready` are swallowed).
+        fn backfill(&mut self) -> Vec<(String, String, Value)> {
+            let mut out = Vec::new();
+            loop {
+                let text = self.next_chunk();
+                if text.trim() == ": ready" {
+                    return out;
+                }
+                if text.starts_with(':') {
+                    continue; // keepalive comment
+                }
+                out.push(Self::parse_frame(&text));
+            }
+        }
+
+        /// Read live chunks until the next real frame (skipping keepalive comments).
+        fn next_frame(&mut self) -> (String, String, Value) {
+            loop {
+                let text = self.next_chunk();
+                if text.starts_with(':') {
+                    continue;
+                }
+                return Self::parse_frame(&text);
+            }
+        }
+
+        fn parse_frame(text: &str) -> (String, String, Value) {
+            let mut event = String::new();
+            let mut id = String::new();
+            let mut data = Value::Null;
+            for line in text.lines() {
+                if let Some(v) = line.strip_prefix("event: ") {
+                    event = v.to_string();
+                } else if let Some(v) = line.strip_prefix("id: ") {
+                    id = v.to_string();
+                } else if let Some(v) = line.strip_prefix("data: ") {
+                    data = serde_json::from_str(v).expect("frame data json");
+                }
+            }
+            (event, id, data)
+        }
+    }
+
+    fn spawn_test_server(conn: Connection, token: &str) -> (Arc<State>, u16) {
         let server = Server::http(("127.0.0.1", 0)).unwrap();
         let port = server.server_addr().to_ip().unwrap().port();
         let state = Arc::new(State {
@@ -1081,47 +1509,187 @@ mod tests {
             gen: Mutex::new(0),
             cvar: Condvar::new(),
         });
-        {
-            let state = Arc::clone(&state);
-            std::thread::spawn(move || {
-                for request in server.incoming_requests() {
-                    let state = Arc::clone(&state);
-                    std::thread::spawn(move || handle(&state, request));
-                }
-            });
-        }
-        // sender fires ~150ms after the waiter parks
+        let state2 = Arc::clone(&state);
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(150));
-            let payload = json!({"agent":"alice","room":"r","text":"wakeup"}).to_string();
-            let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
-            let req = format!(
-                "POST /send HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\n\
-                 Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
-                payload.len()
-            );
-            s.write_all(req.as_bytes()).unwrap();
-            let mut r = String::new();
-            s.read_to_string(&mut r).ok();
+            for request in server.incoming_requests() {
+                let state = Arc::clone(&state2);
+                std::thread::spawn(move || handle(&state, request));
+            }
         });
-        // bob blocks in wait; must return the message well before the 10s timeout
-        let payload = json!({"agent":"bob","room":"r","timeout":10}).to_string();
+        (state, port)
+    }
+
+    fn post(port: u16, token: &str, action: &str, agent: &str, extra: Value) -> Value {
+        let mut map = extra.as_object().cloned().unwrap_or_default();
+        map.insert("agent".into(), json!(agent));
+        let payload = Value::Object(map).to_string();
         let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
         let req = format!(
-            "POST /wait HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\n\
+            "POST /{action} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\n\
              Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
             payload.len()
         );
-        let start = Instant::now();
         s.write_all(req.as_bytes()).unwrap();
         let mut resp = String::new();
         s.read_to_string(&mut resp).unwrap();
-        let body = resp.split_once("\r\n\r\n").unwrap().1;
-        let doc: Value = serde_json::from_str(body).unwrap();
-        assert_eq!(doc["messages"][0]["text"], "wakeup");
+        let body = resp.split_once("\r\n\r\n").map_or("", |x| x.1);
+        serde_json::from_str(body).unwrap_or(Value::Null)
+    }
+
+    /// Replaces the old `wait_wakes_on_send`: a `recv` stream must see a message
+    /// pushed after it connects with no polling loop, well inside notify latency.
+    #[test]
+    fn stream_pushes_new_message_fast() {
+        let token = "t";
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn);
+        op_create_room(&conn, "alice", &json!({"name":"r"})).unwrap();
+        op_join(&conn, "bob", &json!({"room":"r"})).unwrap();
+        let (_state, port) = spawn_test_server(conn, token);
+
+        let mut client =
+            SseClient::connect(port, token, json!({"agent":"bob","mode":"recv","room":"r"}));
+        assert!(client.backfill().is_empty(), "empty room backfills nothing");
+
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            post(
+                port,
+                token,
+                "send",
+                "alice",
+                json!({"room":"r","text":"wakeup"}),
+            );
+        });
+
+        let start = Instant::now();
+        let (event, _id, data) = client.next_frame();
+        assert_eq!(event, "message");
+        assert_eq!(data["text"], "wakeup");
         assert!(
             start.elapsed() < Duration::from_secs(5),
-            "wait should wake fast"
+            "stream should push fast, not wait on a poll interval"
         );
+    }
+
+    /// Reconnect test (acceptance criterion): a `recv` stream that disconnects and
+    /// resumes with the last `Last-Event-ID` it saw must get exactly the messages sent
+    /// while it was offline — zero missed, zero duplicated.
+    #[test]
+    fn stream_reconnect_no_loss_no_dup() {
+        let token = "t";
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn);
+        op_create_room(&conn, "alice", &json!({"name":"r"})).unwrap();
+        op_join(&conn, "bob", &json!({"room":"r"})).unwrap();
+        let (_state, port) = spawn_test_server(conn, token);
+
+        // 3 messages land before bob ever connects.
+        for text in ["m1", "m2", "m3"] {
+            post(
+                port,
+                token,
+                "send",
+                "alice",
+                json!({"room":"r","text":text}),
+            );
+        }
+
+        let mut client =
+            SseClient::connect(port, token, json!({"agent":"bob","mode":"recv","room":"r"}));
+        let backfilled = client.backfill();
+        assert_eq!(backfilled.len(), 3, "sees the full pre-connect backlog");
+        assert_eq!(
+            backfilled
+                .iter()
+                .map(|(_, _, d)| d["text"].clone())
+                .collect::<Vec<_>>(),
+            vec![json!("m1"), json!("m2"), json!("m3")]
+        );
+        let last_id = backfilled.last().unwrap().1.clone();
+        drop(client); // bob "goes offline"
+
+        // 2 more messages land while bob is disconnected.
+        for text in ["m4", "m5"] {
+            post(
+                port,
+                token,
+                "send",
+                "alice",
+                json!({"room":"r","text":text}),
+            );
+        }
+
+        // Reconnect with the last Last-Event-ID: must see exactly m4, m5 (no repeat of
+        // m1-m3, nothing missing).
+        let mut client = SseClient::connect(
+            port,
+            token,
+            json!({"agent":"bob","mode":"recv","room":"r","since":last_id}),
+        );
+        let resumed = client.backfill();
+        assert_eq!(
+            resumed
+                .iter()
+                .map(|(_, _, d)| d["text"].clone())
+                .collect::<Vec<_>>(),
+            vec![json!("m4"), json!("m5")],
+            "reconnect backfill must be exactly the offline window, no loss or dup"
+        );
+
+        // read/inbox stay consistent with what the stream delivered (consuming mode
+        // advances the cursor exactly like the old `wait`/`read`).
+        let unread = post(port, token, "read", "bob", json!({"room":"r","peek":true}));
+        assert!(
+            unread["messages"].as_array().unwrap().is_empty(),
+            "recv's cursor advance leaves nothing unread behind"
+        );
+    }
+
+    /// A `monitor` stream backfills `0:0` by default (full history) and pushes
+    /// `progress` (event) and `roster` frames live, without ever advancing any read
+    /// cursor (peek semantics).
+    #[test]
+    fn stream_monitor_sees_events_and_roster_non_consuming() {
+        let token = "t";
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn);
+        op_create_room(&conn, "alice", &json!({"name":"r"})).unwrap();
+        op_join(&conn, "bob", &json!({"room":"r"})).unwrap();
+        op_join(&conn, "watcher", &json!({"room":"r"})).unwrap();
+        op_send(&conn, "alice", &json!({"room":"r","text":"hi"})).unwrap();
+        let (_state, port) = spawn_test_server(conn, token);
+
+        let mut client =
+            SseClient::connect(port, token, json!({"agent":"watcher","mode":"monitor"}));
+        let backfilled = client.backfill();
+        assert!(
+            backfilled
+                .iter()
+                .any(|(ev, _, d)| ev == "message" && d["text"] == "hi"),
+            "monitor backfills existing messages"
+        );
+        assert!(
+            backfilled.iter().any(|(ev, _, _)| ev == "roster"),
+            "monitor gets an initial roster frame"
+        );
+
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            post(
+                port,
+                token,
+                "event",
+                "alice",
+                json!({"room":"r","kind":"phase","phase":"building"}),
+            );
+        });
+        let (event, _id, data) = client.next_frame();
+        assert_eq!(event, "progress");
+        assert_eq!(data["phase"], "building");
+
+        // monitor never advances bob's read cursor: bob's own recv/read still sees "hi".
+        let unread = post(port, token, "read", "bob", json!({"room":"r","peek":true}));
+        assert_eq!(unread["messages"][0]["text"], "hi");
     }
 }
