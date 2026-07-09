@@ -57,6 +57,46 @@ pub struct AgentView {
 pub struct MsgView {
     pub from: String,
     pub text: String,
+    /// Server epoch millis at insert. `None` for legacy rows written before the
+    /// `ts` column existed (migration leaves them NULL rather than backfilling).
+    pub ts: Option<i64>,
+}
+
+/// A typed progress event (contract v1: 8 kinds - task-start/done/error/abort,
+/// step, phase, blocked, handoff). Lives in its own table server-side, so it is
+/// monitor-only by construction: no cursor, never consumed, always `since`-polled.
+#[derive(Clone, Debug)]
+pub struct EventView {
+    pub seq: i64,
+    pub room: String,
+    pub agent: String,
+    pub kind: String,
+    pub task: Option<String>,
+    pub phase: Option<String>,
+    pub step_cur: Option<i64>,
+    pub step_total: Option<i64>,
+    pub percent: Option<i64>,
+    pub target: Option<String>,
+    pub note: Option<String>,
+    pub ts: i64,
+}
+
+/// One entry in a drilled-in room's merged thread: a message or an event, ready to
+/// be sorted/rendered in `ts` order alongside each other.
+#[derive(Clone, Debug)]
+pub enum ThreadItem {
+    Msg(MsgView),
+    Evt(EventView),
+}
+
+/// The full accumulated thread for whichever room is currently focused (drilled
+/// into) in the view. `None` when no room is focused.
+#[derive(Clone, Debug)]
+pub struct RoomThread {
+    pub room: String,
+    /// Merged messages + events, sorted by (ts, kind) ascending. Legacy messages
+    /// with `ts = None` sort oldest-first.
+    pub items: Vec<ThreadItem>,
 }
 
 /// One room as reported by `comms rooms`, enriched with observed message activity.
@@ -79,6 +119,11 @@ pub struct Snapshot {
     pub health: Health,
     pub agents: Vec<AgentView>,
     pub rooms: Vec<RoomView>,
+    /// Global progress-event ring (all rooms), newest at the back, bounded so
+    /// memory stays flat over a long-running observer. Feeds the progress panel.
+    pub events: Vec<EventView>,
+    /// Full thread for the room the view has focused (drill-in), if any.
+    pub thread: Option<RoomThread>,
     /// Observer identity, so the view can filter it out of the roster.
     pub observer: String,
     /// When the last successful refresh completed.
@@ -93,12 +138,19 @@ impl Snapshot {
             health: Health::Connecting,
             agents: Vec::new(),
             rooms: Vec::new(),
+            events: Vec::new(),
+            thread: None,
             observer,
             last_update: None,
             polls: 0,
         }
     }
 }
+
+/// Room name the view wants drilled into, or `None` for the room list. Written by
+/// view.rs on Enter/Esc, read by data.rs's poller - the *only* way the view
+/// influences what data fetches, so "view never calls the server directly" holds.
+pub type FocusHandle = Arc<Mutex<Option<String>>>;
 
 /// Outcome of a single client call: distinguish "server unreachable" (transport error
 /// => Disconnected) from "server answered with an error status" (still Connected).
@@ -185,6 +237,7 @@ pub fn run(args: &[String]) {
 
     let shared = Arc::new(Mutex::new(Snapshot::initial(cfg.agent.clone())));
     let stop = Arc::new(AtomicBool::new(false));
+    let focus: FocusHandle = Arc::new(Mutex::new(None));
 
     // Background poller fills `shared`; the view renders it on the main thread and
     // flips `stop` when the user quits.
@@ -192,10 +245,11 @@ pub fn run(args: &[String]) {
         let cfg = cfg.clone();
         let shared = Arc::clone(&shared);
         let stop = Arc::clone(&stop);
-        std::thread::spawn(move || data::run(&cfg, shared, stop))
+        let focus = Arc::clone(&focus);
+        std::thread::spawn(move || data::run(&cfg, shared, stop, focus))
     };
 
-    let result = view::run(&cfg, Arc::clone(&shared), Arc::clone(&stop));
+    let result = view::run(&cfg, Arc::clone(&shared), Arc::clone(&stop), Arc::clone(&focus));
 
     // Ensure the poller unwinds even if the view returned on its own.
     stop.store(true, std::sync::atomic::Ordering::SeqCst);

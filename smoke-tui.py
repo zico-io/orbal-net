@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Smoke test for `comms tui`. Self-contained: spawns its own comms server,
-seeds a mission, drives the TUI through a PTY, and asserts it renders live data,
-flips CONNECTED->DISCONNECTED when the server dies, recovers when it returns, and
-quits cleanly. Exits 0 iff every check passes.
+seeds a mission (messages + every progress-event kind), drives the TUI through a
+PTY, and asserts it renders live data, drills into a room's thread and back out,
+shows the progress panel, flips CONNECTED->DISCONNECTED when the server dies,
+recovers when it returns, and quits cleanly. Exits 0 iff every check passes.
 
     python3 comms/smoke-tui.py        # builds the release binary if missing
 
@@ -12,6 +13,10 @@ Traps baked in so we don't thrash on this again:
   - "DISCONNECTED" contains "CONNECTED" -> match CONNECTED with a (?<!DIS) guard.
   - the master fd races the child's exit with EIO -> tolerate it everywhere.
   - liveness via os.kill(pid, 0); reap the child exactly once, at the end.
+  - ratatui's terminal backend skips re-transmitting unchanged/blank cells (uses
+    cursor-forward escapes for gaps), so plain byte-stripped-of-ANSI text can lose
+    a space here and there -> drill-in/progress checks compare whitespace-
+    normalized text, not raw substrings with spaces baked in.
 """
 import os, pty, re, select, signal, struct, subprocess, sys, tempfile, termios, time, fcntl
 
@@ -43,6 +48,12 @@ def wait_ready(deadline=3.0):
 
 def strip_ansi(b):
     return re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", b.decode("utf-8", "replace"))
+
+
+def norm(s):
+    """Collapse/strip whitespace so a lost cursor-forward-skipped space (see the
+    module docstring trap) doesn't break a substring match."""
+    return re.sub(r"\s+", "", s)
 
 
 def alive(pid):
@@ -77,6 +88,19 @@ def main():
     cli("lead-a", "send", "mission-smoke", "worker-a-1: write smoke-ok.txt")
     cli("worker-a-1", "send", "mission-smoke", "on it, writing the file now")
 
+    # seed every event kind (contract v1: 8 kinds) so drill-in + progress panel
+    # have real data to render. task-error/task-abort sit mid-sequence so the
+    # final folded state (asserted below) still lands on task-done/phase/step/
+    # handoff as expected - blocked is cleared by any later event, by design.
+    cli("worker-a-1", "event", "mission-smoke", "task-start", "--task", "build", "--note", "starting build")
+    cli("worker-a-1", "progress", "mission-smoke", "3/8", "--note", "compiling")
+    cli("worker-a-1", "event", "mission-smoke", "phase", "--phase", "implementing")
+    cli("worker-a-1", "event", "mission-smoke", "blocked", "--to", "host", "--note", "waiting on E2E box")
+    cli("worker-a-1", "event", "mission-smoke", "handoff", "--to", "lead-a", "--note", "over to you")
+    cli("worker-a-1", "event", "mission-smoke", "task-error", "--task", "build", "--note", "compile failed")
+    cli("worker-a-1", "event", "mission-smoke", "task-abort", "--task", "build", "--note", "retrying")
+    cli("worker-a-1", "event", "mission-smoke", "task-done", "--task", "build", "--note", "build finished")
+
     pid, fd = pty.fork()
     if pid == 0:  # child
         os.environ.update(ENV)
@@ -101,6 +125,28 @@ def main():
 
     def mark(m): print(m, file=sys.stderr, flush=True)
     mark("phase: connected"); drain(1.8);  connected_alive = alive(pid)
+
+    mark("phase: drill-in")
+    pre_enter = len(cum)
+    try:
+        os.write(fd, b"\r")  # Enter: drill into the (only, pre-selected) room
+    except OSError:
+        pass
+    drain(1.2)
+    post_enter = len(cum)
+    drilled_alive = alive(pid)
+    thread_text = norm(strip_ansi(bytes(cum[pre_enter:post_enter])))
+
+    mark("phase: back")
+    try:
+        os.write(fd, b"\x1b")  # Esc: back out of the thread to the room list
+    except OSError:
+        pass
+    drain(1.0)
+    post_back = len(cum)
+    back_alive = alive(pid)
+    back_text = norm(strip_ansi(bytes(cum[post_enter:post_back])))
+
     mark("phase: kill");      srv.terminate()
     drain(2.5);  killed_alive = alive(pid)
     mark("phase: restart");   srv2 = serve(); wait_ready()
@@ -131,6 +177,7 @@ def main():
     srv2.terminate()
 
     text = strip_ansi(cum)
+    nx = norm(text)
     conn = [m.start() for m in re.finditer(r"(?<!DIS)CONNECTED", text)]  # standalone, not DISCONNECTED
     disc = [m.start() for m in re.finditer(r"DISCONNECTED", text)]
 
@@ -144,6 +191,25 @@ def main():
         ("survives server loss",     killed_alive),
         ("recovers after restart",   restarted_alive and any(c > disc[0] for c in conn) if disc else False),
         ("quits cleanly on 'q'",     quit_clean),
+        # drill-in: Enter opens the room thread with messages + tagged events
+        ("drill-in stays alive",         drilled_alive),
+        ("drill-in shows thread title",  "thread:mission-smoke" in thread_text),
+        ("drill-in shows a message",     "writingthefilenow" in thread_text),
+        ("drill-in tags task-start",     "[task-start]" in thread_text),
+        ("drill-in tags step w/ N/M",    "[step3/8]" in thread_text),
+        ("drill-in tags phase",          "[phase]" in thread_text),
+        ("drill-in tags blocked->target", "blocked->host" in thread_text),
+        ("drill-in tags handoff->target", "handoff->lead-a" in thread_text),
+        ("drill-in tags task-done",      "[task-done]" in thread_text),
+        ("drill-in shows back-nav hint", "Esc:back" in thread_text),
+        # progress panel: per-agent latest-wins fold, visible in both view modes
+        ("progress panel shows agent",   "worker-a-1" in nx),
+        ("progress panel shows phase",   "phase:implementing" in nx),
+        ("progress panel shows step",    "3/8" in nx),
+        ("progress panel shows handoff", "->lead-a" in nx),
+        # Esc backs out to the room list (not a quit) - alive + room-list footer back
+        ("esc backs out (stays alive)",  back_alive),
+        ("esc returns to room list",     "Enter:openthread" in back_text),
     ]
     ok = all(v for _, v in checks)
     for name, v in checks:
