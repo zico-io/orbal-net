@@ -22,6 +22,9 @@ pub const STATES: [&str; 4] = ["active", "idle", "busy", "done"];
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 #[cfg(test)]
 const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(200);
+/// Default bound on a one-shot `recv`'s park-for-first-message wait when the client
+/// doesn't send `timeout` (mirrors the old `wait`'s `DEFAULT_WAIT_SECS`).
+const DEFAULT_RECV_TIMEOUT_SECS: u64 = 120;
 
 /// The 8-kind progress-event vocabulary (contract v1). Each kind names its one
 /// required field (checked in `op_event`); everything else is optional.
@@ -876,6 +879,16 @@ fn write_sse_comment<W: Write>(writer: &mut W, text: &str) -> io::Result<()> {
     write_chunk(writer, format!(": {text}\n\n").as_bytes())
 }
 
+/// The terminating zero-length chunk that ends an HTTP/1.1 chunked body. Only a
+/// one-shot `recv` writes this (it's the only stream that ever closes on its own
+/// initiative rather than via the client disconnecting) — without it, standard HTTP
+/// clients (curl, browsers, most HTTP libraries) see a truncated response rather than
+/// a clean, complete one, even though our own hand-rolled reader tolerates either.
+fn write_chunk_terminator<W: Write>(writer: &mut W) -> io::Result<()> {
+    writer.write_all(b"0\r\n\r\n")?;
+    writer.flush()
+}
+
 /// `POST /stream`: a persistent SSE connection, replacing the old poll-based `wait`.
 /// Holds its own thread for the connection's lifetime (see the thread-per-request note
 /// in `run`). `mode: "recv"` is a single-room consuming stream (advances the agent's
@@ -900,6 +913,14 @@ fn handle_stream(state: &State, request: tiny_http::Request, agent: String, body
     if !is_monitor && room.is_none() {
         return reply(request, 400, json!({ "error": "recv requires 'room'" }));
     }
+    // `follow` only means anything for `recv` (monitor is always a persistent,
+    // non-consuming tail regardless). `recv` with `follow: false` (the default) is
+    // one-shot: deliver whatever's due, then the SERVER closes the connection — see
+    // the dedicated one-shot loop below for why that ownership matters.
+    let follow = body.get("follow").and_then(Value::as_bool).unwrap_or(false);
+    let timeout_secs = opt_i64(&body, "timeout")
+        .filter(|t| *t > 0)
+        .unwrap_or(DEFAULT_RECV_TIMEOUT_SECS as i64) as u64;
 
     let since_header = request
         .headers()
@@ -930,6 +951,10 @@ fn handle_stream(state: &State, request: tiny_http::Request, agent: String, body
         return;
     }
     let mut last_roster: Option<Value> = None;
+    // Set if the backfill below delivers at least one message. A one-shot `recv`
+    // (`!follow`) that already delivered something during backfill must close right
+    // after `: ready` rather than enter any further loop — see the dispatch below.
+    let mut delivered_backfill = false;
 
     // Backfill (since, max] under one DB-lock snapshot, then `: ready`, then go live.
     // Holding the lock across the whole snapshot+backfill makes it atomic: nothing can
@@ -941,6 +966,7 @@ fn handle_stream(state: &State, request: tiny_http::Request, agent: String, body
         let scope = stream_scope(&conn, &agent, &room);
         for m in messages_after_multi(&conn, &scope, last_msg) {
             last_msg = m["seq"].as_i64().unwrap();
+            delivered_backfill = true;
             if write_sse_frame(
                 &mut writer,
                 "message",
@@ -951,7 +977,9 @@ fn handle_stream(state: &State, request: tiny_http::Request, agent: String, body
             {
                 return;
             }
-            if !is_monitor {
+            // `follow` is a non-consuming tail (contract v2): even messages delivered
+            // during its backfill must not advance the cursor.
+            if !is_monitor && !follow {
                 advance_cursor(&conn, &agent, room.as_deref().unwrap(), last_msg);
             }
         }
@@ -987,109 +1015,171 @@ fn handle_stream(state: &State, request: tiny_http::Request, agent: String, body
         return;
     }
 
-    let mut last_activity = Instant::now();
-    loop {
-        // Snapshot gen BEFORE reading rows: senders commit then bump gen+notify_all
-        // (see `handle`), so any row landing after this snapshot also bumps gen.
-        // Checking it again right before parking (below) closes the lost-wakeup window
-        // between releasing the DB lock here and taking the gen lock to park — without
-        // this, a notify landing in that window wakes nobody (this thread isn't parked
-        // yet) and the row would sit until the next keepalive timeout instead of being
-        // delivered at notify latency.
-        let gen_seen = *state.gen.lock().unwrap();
-        let (msgs, evts, roster_opt) = {
-            let conn = state.db.lock().unwrap();
-            let scope = stream_scope(&conn, &agent, &room);
-            let msgs = messages_after_multi(&conn, &scope, last_msg);
-            let evts = if is_monitor {
-                events_after_multi(&conn, &scope, last_evt)
-            } else {
-                Vec::new()
-            };
-            let roster = if is_monitor {
-                let r = roster_snapshot(&conn);
-                if last_roster.as_ref() != Some(&r) {
-                    Some(r)
+    if is_monitor || follow {
+        // monitor and `recv --follow` are persistent, live-forever connections (the
+        // latter non-consuming — see the cursor-advance guards below and in the
+        // backfill above). They only end when the client disconnects (a write fails).
+        let mut last_activity = Instant::now();
+        loop {
+            // Snapshot gen BEFORE reading rows: senders commit then bump gen+notify_all
+            // (see `handle`), so any row landing after this snapshot also bumps gen.
+            // Checking it again right before parking (below) closes the lost-wakeup
+            // window between releasing the DB lock here and taking the gen lock to
+            // park — without this, a notify landing in that window wakes nobody (this
+            // thread isn't parked yet) and the row would sit until the next keepalive
+            // timeout instead of being delivered at notify latency.
+            let gen_seen = *state.gen.lock().unwrap();
+            let (msgs, evts, roster_opt) = {
+                let conn = state.db.lock().unwrap();
+                let scope = stream_scope(&conn, &agent, &room);
+                let msgs = messages_after_multi(&conn, &scope, last_msg);
+                let evts = if is_monitor {
+                    events_after_multi(&conn, &scope, last_evt)
+                } else {
+                    Vec::new()
+                };
+                let roster = if is_monitor {
+                    let r = roster_snapshot(&conn);
+                    if last_roster.as_ref() != Some(&r) {
+                        Some(r)
+                    } else {
+                        None
+                    }
                 } else {
                     None
-                }
-            } else {
-                None
+                };
+                (msgs, evts, roster)
             };
-            (msgs, evts, roster)
-        };
 
-        let mut wrote = false;
-        for m in &msgs {
-            last_msg = m["seq"].as_i64().unwrap();
-            if write_sse_frame(&mut writer, "message", &format!("{last_msg}:{last_evt}"), m)
-                .is_err()
-            {
-                return;
+            let mut wrote = false;
+            for m in &msgs {
+                last_msg = m["seq"].as_i64().unwrap();
+                if write_sse_frame(&mut writer, "message", &format!("{last_msg}:{last_evt}"), m)
+                    .is_err()
+                {
+                    return;
+                }
+                if !is_monitor && !follow {
+                    let conn = state.db.lock().unwrap();
+                    advance_cursor(&conn, &agent, room.as_deref().unwrap(), last_msg);
+                }
+                wrote = true;
             }
-            if !is_monitor {
+            for e in &evts {
+                last_evt = e["seq"].as_i64().unwrap();
+                if write_sse_frame(
+                    &mut writer,
+                    "progress",
+                    &format!("{last_msg}:{last_evt}"),
+                    e,
+                )
+                .is_err()
+                {
+                    return;
+                }
+                wrote = true;
+            }
+            if let Some(r) = roster_opt {
+                if write_sse_frame(&mut writer, "roster", &format!("{last_msg}:{last_evt}"), &r)
+                    .is_err()
+                {
+                    return;
+                }
+                last_roster = Some(r);
+                wrote = true;
+            }
+
+            if wrote {
+                last_activity = Instant::now();
+                continue;
+            }
+
+            // Test-only fault injection point: lets a test deterministically force a
+            // sender's commit+notify to land exactly here, between our DB-unlock (the
+            // query above found nothing) and the gen-lock/park below — the lost-wakeup
+            // window `gen_seen` exists to close. A no-op outside tests.
+            #[cfg(test)]
+            race_hook_pause_point();
+
+            if last_activity.elapsed() >= KEEPALIVE_INTERVAL {
+                if write_sse_comment(&mut writer, "keepalive").is_err() {
+                    return;
+                }
+                last_activity = Instant::now();
+            }
+
+            // Park until notified; re-query "> last-sent" on every wake (notify or
+            // keepalive timeout) rather than trusting the wake reason. Not a
+            // correctness backstop (delivery is notify-driven) — purely what drives
+            // the keepalive timer.
+            let remaining = KEEPALIVE_INTERVAL
+                .saturating_sub(last_activity.elapsed())
+                .max(Duration::from_millis(100));
+            let guard = state.gen.lock().unwrap();
+            if *guard != gen_seen {
+                // A notify landed between our DB-unlock and this gen-lock: don't park
+                // on a Condvar nobody will signal again soon, re-query instead.
+                continue;
+            }
+            let _ = state.cvar.wait_timeout(guard, remaining).unwrap();
+        }
+    } else if !delivered_backfill {
+        // One-shot `recv` (the `wait` drop-in) that had nothing due at connect time:
+        // park, bounded by `timeout_secs`, for the first message to land, deliver it
+        // (advancing the cursor, same as backfill), then the SERVER closes the
+        // connection — it never falls through into the persistent loop above. This is
+        // the fix for the lost-message bug: a lingering post-backfill live-loop thread
+        // would still be in `recv`'s CONSUMING mode, so a message landing after the
+        // client already closed its socket got silently consumed (cursor advanced)
+        // and written into a dead connection — delivered to nobody. Owning the
+        // lifecycle here (return the moment something is delivered, or the moment the
+        // deadline passes) guarantees no consumer ever outlives its client.
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        loop {
+            let gen_seen = *state.gen.lock().unwrap();
+            let msgs = {
                 let conn = state.db.lock().unwrap();
-                advance_cursor(&conn, &agent, room.as_deref().unwrap(), last_msg);
+                messages_after_multi(
+                    &conn,
+                    std::slice::from_ref(room.as_ref().unwrap()),
+                    last_msg,
+                )
+            };
+            if !msgs.is_empty() {
+                for m in &msgs {
+                    last_msg = m["seq"].as_i64().unwrap();
+                    if write_sse_frame(&mut writer, "message", &format!("{last_msg}:{last_evt}"), m)
+                        .is_err()
+                    {
+                        return;
+                    }
+                    let conn = state.db.lock().unwrap();
+                    advance_cursor(&conn, &agent, room.as_deref().unwrap(), last_msg);
+                }
+                break; // one-shot: close as soon as a batch is delivered
             }
-            wrote = true;
-        }
-        for e in &evts {
-            last_evt = e["seq"].as_i64().unwrap();
-            if write_sse_frame(
-                &mut writer,
-                "progress",
-                &format!("{last_msg}:{last_evt}"),
-                e,
-            )
-            .is_err()
-            {
-                return;
+
+            #[cfg(test)]
+            race_hook_pause_point();
+
+            let now = Instant::now();
+            if now >= deadline {
+                break; // timeout, nothing delivered — client sees `: ready` then close
             }
-            wrote = true;
-        }
-        if let Some(r) = roster_opt {
-            if write_sse_frame(&mut writer, "roster", &format!("{last_msg}:{last_evt}"), &r)
-                .is_err()
-            {
-                return;
+            let remaining = (deadline - now).min(KEEPALIVE_INTERVAL);
+            let guard = state.gen.lock().unwrap();
+            if *guard != gen_seen {
+                continue;
             }
-            last_roster = Some(r);
-            wrote = true;
+            let _ = state.cvar.wait_timeout(guard, remaining).unwrap();
         }
-
-        if wrote {
-            last_activity = Instant::now();
-            continue;
-        }
-
-        // Test-only fault injection point: lets a test deterministically force a
-        // sender's commit+notify to land exactly here, between our DB-unlock (the
-        // query above found nothing) and the gen-lock/park below — the lost-wakeup
-        // window `gen_seen` exists to close. A no-op outside tests.
-        #[cfg(test)]
-        race_hook_pause_point();
-
-        if last_activity.elapsed() >= KEEPALIVE_INTERVAL {
-            if write_sse_comment(&mut writer, "keepalive").is_err() {
-                return;
-            }
-            last_activity = Instant::now();
-        }
-
-        // Park until notified; re-query "> last-sent" on every wake (notify or
-        // keepalive timeout) rather than trusting the wake reason. Not a correctness
-        // backstop (delivery is notify-driven) — purely what drives the keepalive timer.
-        let remaining = KEEPALIVE_INTERVAL
-            .saturating_sub(last_activity.elapsed())
-            .max(Duration::from_millis(100));
-        let guard = state.gen.lock().unwrap();
-        if *guard != gen_seen {
-            // A notify landed between our DB-unlock and this gen-lock: don't park on a
-            // Condvar nobody will signal again soon, loop straight back to re-query.
-            continue;
-        }
-        let _ = state.cvar.wait_timeout(guard, remaining).unwrap();
     }
+    // Reached only by a one-shot `recv` that is now done — whether it delivered
+    // during backfill, delivered in the bounded wait above, or timed out empty. Write
+    // the proper chunked terminator (the persistent monitor/follow loop above never
+    // falls through to here; it only exits via early `return` on a write error, where
+    // there's nothing left to write) and let the connection close.
+    let _ = write_chunk_terminator(&mut writer);
 }
 
 /// Deterministic fault-injection rendezvous for `stream_lost_wakeup_regression`: when
@@ -1478,9 +1568,18 @@ mod tests {
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
+            // Connection: close on the REQUEST, not keep-alive: tiny_http decides
+            // whether to keep reading further pipelined requests off this socket
+            // purely from what the client's request declares here (see
+            // ClientConnection::next in the tiny_http source) — it never inspects our
+            // hand-rolled response bytes. We never pipeline a second request on a
+            // /stream connection in any mode, so this is correct universally; for a
+            // one-shot recv it's also what lets the server's own proactive close (see
+            // handle_stream's one-shot branch) actually tear down the socket instead of
+            // tiny_http idling, waiting to read a next request that will never come.
             let req = format!(
                 "POST /stream HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\n\
-                 Content-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{payload}",
+                 Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
                 payload.len()
             );
             stream.write_all(req.as_bytes()).unwrap();
@@ -1497,6 +1596,18 @@ mod tests {
             let n = self.stream.read(&mut chunk).expect("stream read");
             assert!(n > 0, "stream closed unexpectedly");
             self.buf.extend_from_slice(&chunk[..n]);
+        }
+
+        /// Like `fill`, but a clean EOF (the server closing the connection, e.g. a
+        /// one-shot `recv` that's done) is a normal outcome, not a panic.
+        fn fill_or_eof(&mut self) -> bool {
+            let mut chunk = [0u8; 4096];
+            let n = self.stream.read(&mut chunk).expect("stream read");
+            if n == 0 {
+                return false;
+            }
+            self.buf.extend_from_slice(&chunk[..n]);
+            true
         }
 
         fn find(&self, needle: &[u8]) -> Option<usize> {
@@ -1558,6 +1669,45 @@ mod tests {
             }
         }
 
+        /// One de-chunked chunk, or `None` on a clean connection close. The new
+        /// one-shot `recv` client contract: read until the SERVER closes (not until
+        /// `: ready`), since it may deliver backlog, then a live batch, then close.
+        fn try_next_chunk(&mut self) -> Option<String> {
+            loop {
+                if let Some(pos) = self.find(b"\r\n") {
+                    let len_str = std::str::from_utf8(&self.buf[..pos]).unwrap().trim();
+                    let len = usize::from_str_radix(len_str, 16).expect("chunk len");
+                    let start = pos + 2;
+                    let end = start + len;
+                    if self.buf.len() >= end + 2 {
+                        let text = String::from_utf8(self.buf[start..end].to_vec()).unwrap();
+                        self.buf.drain(..end + 2);
+                        return Some(text);
+                    }
+                }
+                if !self.fill_or_eof() {
+                    return None;
+                }
+            }
+        }
+
+        /// Read every message frame until the server closes the connection, matching
+        /// the one-shot `recv` client contract (accumulate backlog + any live batch,
+        /// then the connection ends — never read past what the server chose to send).
+        fn read_messages_until_close(&mut self) -> Vec<Value> {
+            let mut out = Vec::new();
+            while let Some(text) = self.try_next_chunk() {
+                // Empty text is the zero-length terminator chunk (`0\r\n\r\n`) a
+                // one-shot recv writes before closing — not a frame.
+                if text.is_empty() || text.starts_with(':') {
+                    continue;
+                }
+                let (_, _, data) = Self::parse_frame(&text);
+                out.push(data);
+            }
+            out
+        }
+
         fn parse_frame(text: &str) -> (String, String, Value) {
             let mut event = String::new();
             let mut id = String::new();
@@ -1609,6 +1759,156 @@ mod tests {
         s.read_to_string(&mut resp).unwrap();
         let body = resp.split_once("\r\n\r\n").map_or("", |x| x.1);
         serde_json::from_str(body).unwrap_or(Value::Null)
+    }
+
+    /// One full one-shot `recv` round trip: connect (a fresh socket, matching the real
+    /// client — this is NOT `next_frame`/`backfill` on a socket kept open across
+    /// calls), read to server-close, return the `text` of every message frame seen.
+    /// `follow: false` (the client's real default) is set explicitly here so tests
+    /// don't silently pass if that default ever flips.
+    fn recv_once(
+        port: u16,
+        token: &str,
+        agent: &str,
+        room: &str,
+        timeout_secs: u64,
+    ) -> Vec<String> {
+        let client_body = json!({
+            "agent": agent, "mode": "recv", "room": room,
+            "follow": false, "timeout": timeout_secs,
+        });
+        let mut client = SseClient::connect(port, token, client_body);
+        client
+            .read_messages_until_close()
+            .into_iter()
+            .map(|d| d["text"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// The bug (mission E2E, push-lead's report): one-shot `recv`'s server-side thread
+    /// used to linger in a persistent CONSUMING loop after the client already closed
+    /// its socket. A message landing later got silently delivered into that dead
+    /// connection and its cursor advanced — consumed and lost, to nobody. Needs a
+    /// client that actually CLOSES between calls (a persistent open socket, like
+    /// `next_frame`/`backfill` reuse in the other stream tests, can't reproduce this —
+    /// it never gives the server a chance to think the reader is still there and then
+    /// prove it isn't).
+    #[test]
+    fn stream_recv_cycle_no_loss() {
+        let token = "t";
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn);
+        op_create_room(&conn, "alice", &json!({"name":"r"})).unwrap();
+        op_join(&conn, "bob", &json!({"room":"r"})).unwrap();
+        let (_state, port) = spawn_test_server(conn, token);
+
+        post(
+            port,
+            token,
+            "send",
+            "alice",
+            json!({"room":"r","text":"a1"}),
+        );
+        assert_eq!(recv_once(port, token, "bob", "r", 5), vec!["a1"]);
+
+        post(
+            port,
+            token,
+            "send",
+            "alice",
+            json!({"room":"r","text":"a2"}),
+        );
+        assert_eq!(recv_once(port, token, "bob", "r", 5), vec!["a2"]);
+
+        post(
+            port,
+            token,
+            "send",
+            "alice",
+            json!({"room":"r","text":"a3"}),
+        );
+        post(
+            port,
+            token,
+            "send",
+            "alice",
+            json!({"room":"r","text":"a4"}),
+        );
+        assert_eq!(recv_once(port, token, "bob", "r", 5), vec!["a3", "a4"]);
+    }
+
+    /// Same bug, minimal repro: get a batch, close, then prove nothing lingers to
+    /// steal the NEXT message. The sleep gives a buggy lingering thread every
+    /// opportunity to park and "win" the race against the next recv — this isn't a
+    /// timing-sensitive assertion, a lingering consumer always eventually steals a
+    /// message that arrives while it's alive, there's no window to get lucky in.
+    #[test]
+    fn stream_recv_one_shot_leaves_no_lingering_consumer() {
+        let token = "t";
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn);
+        op_create_room(&conn, "alice", &json!({"name":"r"})).unwrap();
+        op_join(&conn, "bob", &json!({"room":"r"})).unwrap();
+        let (_state, port) = spawn_test_server(conn, token);
+
+        post(
+            port,
+            token,
+            "send",
+            "alice",
+            json!({"room":"r","text":"first"}),
+        );
+        assert_eq!(recv_once(port, token, "bob", "r", 5), vec!["first"]);
+
+        std::thread::sleep(Duration::from_millis(100));
+        post(
+            port,
+            token,
+            "send",
+            "alice",
+            json!({"room":"r","text":"second"}),
+        );
+        assert_eq!(
+            recv_once(port, token, "bob", "r", 5),
+            vec!["second"],
+            "a lingering server-side consumer stole the message before this recv connected"
+        );
+    }
+
+    /// `recv --follow` is a non-consuming tail (contract v2): messages it delivers,
+    /// including during its own backfill, must not advance the agent's read cursor —
+    /// a later one-shot `recv` must still see them.
+    #[test]
+    fn stream_follow_is_non_consuming() {
+        let token = "t";
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn);
+        op_create_room(&conn, "alice", &json!({"name":"r"})).unwrap();
+        op_join(&conn, "bob", &json!({"room":"r"})).unwrap();
+        op_send(&conn, "alice", &json!({"room":"r","text":"m1"})).unwrap();
+        let (_state, port) = spawn_test_server(conn, token);
+
+        let mut follow_client = SseClient::connect(
+            port,
+            token,
+            json!({"agent":"bob","mode":"recv","room":"r","follow":true}),
+        );
+        let backfilled = follow_client.backfill();
+        assert_eq!(
+            backfilled
+                .iter()
+                .map(|(_, _, d)| d["text"].clone())
+                .collect::<Vec<_>>(),
+            vec![json!("m1")],
+            "follow still backfills unread messages, just without consuming them"
+        );
+        drop(follow_client); // the tail disconnects
+
+        assert_eq!(
+            recv_once(port, token, "bob", "r", 5),
+            vec!["m1"],
+            "follow must not have advanced bob's cursor"
+        );
     }
 
     /// Replaces the old `wait_wakes_on_send`: a `recv` stream must see a message
@@ -1876,8 +2176,14 @@ mod tests {
         op_join(&conn, "bob", &json!({"room":"r"})).unwrap();
         let (_state, port) = spawn_test_server(conn, token);
 
-        let mut client =
-            SseClient::connect(port, token, json!({"agent":"bob","mode":"recv","room":"r"}));
+        // follow: true — this test exercises the persistent live loop's latency, which
+        // one-shot recv (the default) intentionally doesn't have: it closes after its
+        // first delivered batch (see stream_recv_cycle_no_loss for that contract).
+        let mut client = SseClient::connect(
+            port,
+            token,
+            json!({"agent":"bob","mode":"recv","room":"r","follow":true}),
+        );
         assert!(client.backfill().is_empty());
 
         // A persistent sender hammering `send` back-to-back (no per-message spawn
@@ -1946,8 +2252,13 @@ mod tests {
             }
         });
 
-        let mut client =
-            SseClient::connect(port, token, json!({"agent":"bob","mode":"recv","room":"r"}));
+        // follow: true — this test wants many messages over one long-lived connection,
+        // which is the persistent-tail path, not one-shot recv's close-after-first-batch.
+        let mut client = SseClient::connect(
+            port,
+            token,
+            json!({"agent":"bob","mode":"recv","room":"r","follow":true}),
+        );
         let mut seen = std::collections::HashSet::new();
         for (_, _, d) in client.backfill() {
             assert!(
@@ -1981,8 +2292,14 @@ mod tests {
         op_join(&conn, "bob", &json!({"room":"r"})).unwrap();
         let (_state, port) = spawn_test_server(conn, token);
 
-        let mut client =
-            SseClient::connect(port, token, json!({"agent":"bob","mode":"recv","room":"r"}));
+        // follow: true — one-shot recv's bounded wait doesn't emit keepalives (it's
+        // bounded by `timeout` and returns the moment something is delivered or the
+        // deadline passes); keepalive is a persistent-connection concern.
+        let mut client = SseClient::connect(
+            port,
+            token,
+            json!({"agent":"bob","mode":"recv","room":"r","follow":true}),
+        );
         assert!(client.backfill().is_empty());
 
         let text = client.next_chunk();
