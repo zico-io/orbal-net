@@ -6,8 +6,9 @@
 //! persisted in SQLite so a server restart mid-mission loses nothing.
 //!
 //! Transport is JSON-over-HTTP, one path per action, Bearer-token auth (the server
-//! binds 0.0.0.0 so local-NAT + remote containers can dial in). The client reads its
-//! target and identity from the environment:
+//! binds 0.0.0.0 so local-NAT + remote containers can dial in) - except `recv` and
+//! the TUI, which hold one persistent `POST /stream` (server-sent events) connection
+//! instead of polling. The client reads its target and identity from the environment:
 //!
 //!   ORBAL_NET_URL    base URL of the mission's server, e.g. http://10.0.0.4:54123
 //!   ORBAL_NET_TOKEN  the mission's bearer token
@@ -21,7 +22,8 @@
 //!   orbal-net send <room> <message...>
 //!   orbal-net dm <agent> <message...>
 //!   orbal-net read <room> [--since <seq>]
-//!   orbal-net wait <room> [--since <seq>] [--timeout <secs>]   # blocking long-poll read
+//!   orbal-net recv <room> [--since <id>] [--timeout <secs>] [--follow]   # SSE-backed
+//!               blocking read (contract v1, mission-orbal-net-push)
 //!   orbal-net invite <room> <agent> | kick <room> <agent>
 //!   orbal-net event <room> <kind> [--task T] [--phase P] [--step N/M] [--percent P]
 //!               [--to AGENT] [--note <text...>]            # emit a progress event
@@ -37,6 +39,7 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 mod server;
+mod sse;
 mod tui;
 
 const USAGE: &str = "\
@@ -50,7 +53,7 @@ orbal-net <subcommand> [args]
   dm <agent> <message...>
   read <room> [--since <seq>]
   peek <room> [--since <seq>]   # read without advancing your cursor (monitoring)
-  wait <room> [--since <seq>] [--timeout <secs>]
+  recv <room> [--since <id>] [--timeout <secs>] [--follow]   # SSE-backed blocking read
   invite <room> <agent> | kick <room> <agent>
   event <room> <kind> [--task T] [--phase P] [--step N/M] [--percent P] [--to AGENT] [--note <text...>]
     kinds: task-start | task-done | task-error | task-abort | step | phase | blocked | handoff
@@ -72,6 +75,7 @@ fn main() {
         }
         Some("serve") => server::run(&args[1..]),
         Some("tui") | Some("watch") => tui::run(&args[1..]),
+        Some("recv") => recv(&args[1..]),
         Some("--selfcheck") => match server::selfcheck() {
             Ok(()) => println!("orbal-net selfcheck ok"),
             Err(e) => die(format!("selfcheck failed: {e}")),
@@ -93,6 +97,134 @@ fn parse_opt(args: &[String], name: &str) -> (Option<String>, Vec<String>) {
     } else {
         (None, args.to_vec())
     }
+}
+
+/// Pull a bare `--name` flag out of args, returning (present, remaining args).
+fn parse_flag(args: &[String], name: &str) -> (bool, Vec<String>) {
+    if let Some(i) = args.iter().position(|a| a == name) {
+        let mut rest = args.to_vec();
+        rest.remove(i);
+        (true, rest)
+    } else {
+        (false, args.to_vec())
+    }
+}
+
+/// Read `ORBAL_NET_URL`/`ORBAL_NET_TOKEN`/`ORBAL_NET_AGENT`, or die with a usage
+/// hint if any are unset.
+fn env_triple() -> (String, String, String) {
+    match (
+        env::var("ORBAL_NET_URL").ok().filter(|s| !s.is_empty()),
+        env::var("ORBAL_NET_TOKEN").ok().filter(|s| !s.is_empty()),
+        env::var("ORBAL_NET_AGENT").ok().filter(|s| !s.is_empty()),
+    ) {
+        (Some(u), Some(t), Some(a)) => (u, t, a),
+        _ => die("ORBAL_NET_URL, ORBAL_NET_TOKEN and ORBAL_NET_AGENT must all be set"),
+    }
+}
+
+/// `orbal-net recv <room> [--since <id>] [--timeout <secs>] [--follow]` - SSE-backed
+/// replacement for `wait` (contract v2, mission-orbal-net-push - amended after a
+/// release-blocking bug: a v1 client that closed after its first message left the
+/// server's stream thread lingering in the live loop, so the NEXT message to land
+/// got consumed-and-lost into a dead socket. v2 fixes this by making the SERVER own
+/// the one-shot lifecycle: it sends `follow`/`timeout` in the request, and for
+/// `follow=false` the server itself closes the connection once it has delivered
+/// everything for this call (backlog, or whatever arrived while parked up to
+/// `timeout`) - no thread ever lingers past one call. The client's job is just to
+/// read every message frame until the server closes (never assume "first message"
+/// or "`: ready`" means done - the server may deliver a multi-message batch before
+/// closing), then print `{room,messages:[...]}` (empty on timeout), matching `wait`.
+/// `--follow` is a live, NON-CONSUMING tail (server-owned; never advances the room's
+/// read cursor) - it stays open printing one JSON line per message until killed.
+fn recv(args: &[String]) {
+    let (since, args) = parse_opt(args, "--since");
+    let (timeout, args) = parse_opt(&args, "--timeout");
+    let (follow, args) = parse_flag(&args, "--follow");
+    if args.len() != 1 {
+        die("usage: orbal-net recv <room> [--since <id>] [--timeout <secs>] [--follow]");
+    }
+    let room = args[0].clone();
+    if let Some(s) = &since {
+        if sse::parse_since(s).is_none() {
+            die(format!(
+                "bad --since value {s:?}; want \"<msgSeq>:<evtSeq>\""
+            ));
+        }
+    }
+    let timeout_secs: u64 = timeout
+        .as_deref()
+        .map(|t| {
+            t.parse()
+                .unwrap_or_else(|_| die(format!("bad --timeout value {t:?}")))
+        })
+        .unwrap_or(120);
+
+    let (url, token, agent) = env_triple();
+    let payload = json!({
+        "agent": agent, "mode": "recv", "room": room, "follow": follow, "timeout": timeout_secs,
+    })
+    .to_string();
+
+    let (code, stream) = open_stream(&url, &token, &payload, since.as_deref())
+        .unwrap_or_else(|e| die(format!("cannot reach {url} ({e})")));
+    if code != 200 {
+        die(format!("recv: {code} {}", read_error_detail(stream)));
+    }
+
+    if follow {
+        // Live tail: blocks forever (no read timeout), one JSON line per message.
+        let mut reader = sse::SseReader::new(sse::ChunkedReader::new(stream));
+        loop {
+            match reader.next_event() {
+                Ok(Some(sse::SseEvent::Frame { event, data, .. })) if event == "message" => {
+                    let msg: Value = serde_json::from_str(&data).unwrap_or(Value::Null);
+                    println!("{msg}");
+                }
+                Ok(Some(_)) => {} // ready/keepalive/other frame kinds: keep reading
+                Ok(None) => die("recv: server closed the stream"),
+                Err(e) => die(format!("recv: {e}")),
+            }
+        }
+    }
+
+    // One-shot: the server is authoritative on when this call ends - it closes the
+    // connection itself once done (backlog delivered, or the timeout parked-wait
+    // resolved). Read every message frame until that close (`Ok(None)`); never
+    // return early on the first message; a `set_read_timeout` backstop well above
+    // the requested server timeout guards against a server that never closes.
+    stream
+        .set_read_timeout(Some(Duration::from_secs(timeout_secs + 10)))
+        .ok();
+    let mut reader = sse::SseReader::new(sse::ChunkedReader::new(stream));
+    let mut messages: Vec<Value> = Vec::new();
+    loop {
+        match reader.next_event() {
+            Ok(Some(sse::SseEvent::Frame { event, data, .. })) if event == "message" => {
+                messages.push(serde_json::from_str(&data).unwrap_or(Value::Null));
+            }
+            Ok(Some(_)) => {} // ready/keepalive/other: keep reading, server ends the call
+            Ok(None) => break, // server closed - the call is over
+            Err(e) if is_timeout(&e) => die(format!(
+                "recv: server did not close within {}s (backstop) - is it hung?",
+                timeout_secs + 10
+            )),
+            Err(e) => die(format!("recv: {e}")),
+        }
+    }
+    print_messages(&room, messages);
+}
+
+fn is_timeout(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
+}
+
+fn print_messages(room: &str, messages: Vec<Value>) {
+    let out = json!({ "room": room, "messages": messages });
+    println!("{}", serde_json::to_string_pretty(&out).unwrap());
 }
 
 /// Split `--note <text...>` off the end of args: everything after `--note` is
@@ -126,9 +258,8 @@ fn client(argv: &[String]) {
     let wire_action = if cmd == "progress" { "event" } else { cmd };
     let rest: Vec<String> = argv[1..].to_vec();
 
-    // (action, body-fields, is_wait) — body always gets "agent" added by post().
+    // body always gets "agent" added below.
     let mut body = serde_json::Map::new();
-    let mut is_wait = false;
 
     match cmd {
         "whoami" | "agents" | "rooms" | "inbox" => {}
@@ -181,21 +312,6 @@ fn client(argv: &[String]) {
             if cmd == "peek" {
                 body.insert("peek".into(), json!(true));
             }
-        }
-        "wait" => {
-            let (since, rest) = parse_opt(&rest, "--since");
-            let (timeout, rest) = parse_opt(&rest, "--timeout");
-            if rest.len() != 1 {
-                die("usage: orbal-net wait <room> [--since <seq>] [--timeout <secs>]");
-            }
-            body.insert("room".into(), json!(rest[0]));
-            if let Some(s) = since {
-                body.insert("since".into(), json!(s));
-            }
-            if let Some(t) = &timeout {
-                body.insert("timeout".into(), json!(t));
-            }
-            is_wait = true;
         }
         "invite" | "kick" => {
             if rest.len() != 2 {
@@ -283,25 +399,11 @@ fn client(argv: &[String]) {
         )),
     }
 
-    let url = env::var("ORBAL_NET_URL").ok();
-    let token = env::var("ORBAL_NET_TOKEN").ok();
-    let agent = env::var("ORBAL_NET_AGENT").ok();
-    let (url, token, agent) = match (url, token, agent) {
-        (Some(u), Some(t), Some(a)) if !u.is_empty() && !t.is_empty() && !a.is_empty() => (u, t, a),
-        _ => die("ORBAL_NET_URL, ORBAL_NET_TOKEN and ORBAL_NET_AGENT must all be set"),
-    };
+    let (url, token, agent) = env_triple();
     body.insert("agent".into(), json!(agent));
     let payload = Value::Object(body).to_string();
 
-    // `wait` long-polls: give the read a generous ceiling above the server's own
-    // timeout so a normal return arrives, but a dead network still fails eventually.
-    let read_timeout = if is_wait {
-        Duration::from_secs(600)
-    } else {
-        Duration::from_secs(30)
-    };
-
-    match http_post(&url, &token, wire_action, &payload, read_timeout) {
+    match http_post(&url, &token, wire_action, &payload, Duration::from_secs(30)) {
         Ok((code, body)) => {
             let doc: Value = serde_json::from_str(&body).unwrap_or(json!({ "raw": body }));
             if code == 200 {
@@ -361,4 +463,81 @@ pub(crate) fn http_post(
 
 fn io_err(msg: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg)
+}
+
+/// Open a persistent `POST /stream` SSE connection (`Connection: keep-alive`, unlike
+/// `http_post`'s one-shot `close`). Returns the response status code and the raw
+/// `TcpStream`, positioned right after the HTTP headers - the caller wraps it in
+/// `sse::ChunkedReader`/`sse::SseReader` on 200, or reads the (non-chunked) JSON error
+/// body directly on failure. `since` is sent as `Last-Event-ID`, the header the server
+/// checks first for resume (contract v1, wire contract seq 8).
+pub(crate) fn open_stream(
+    base: &str,
+    token: &str,
+    body: &str,
+    since: Option<&str>,
+) -> std::io::Result<(u16, TcpStream)> {
+    let rest = base
+        .trim()
+        .trim_end_matches('/')
+        .strip_prefix("http://")
+        .ok_or_else(|| io_err("ORBAL_NET_URL must start with http://"))?;
+    let (hostport, base_path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    let path = format!("{}/stream", base_path.trim_end_matches('/'));
+
+    let mut stream = TcpStream::connect(hostport)?;
+    let mut req = format!(
+        "POST {path} HTTP/1.1\r\nHost: {hostport}\r\nAuthorization: Bearer {token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n",
+        body.len()
+    );
+    if let Some(id) = since {
+        req.push_str(&format!("Last-Event-ID: {id}\r\n"));
+    }
+    req.push_str("\r\n");
+    req.push_str(body);
+    stream.write_all(req.as_bytes())?;
+
+    let code = read_status_line(&mut stream)?;
+    Ok((code, stream))
+}
+
+/// Read the HTTP status line + headers off `stream` one byte at a time (headers are a
+/// few hundred bytes at most, so simplicity beats buffering here - and a buffered read
+/// risks swallowing chunked-body bytes past the header boundary), returning the status
+/// code. Leaves `stream` positioned exactly at the start of the body.
+fn read_status_line(stream: &mut TcpStream) -> std::io::Result<u16> {
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let n = stream.read(&mut byte)?;
+        if n == 0 {
+            return Err(io_err("connection closed before headers"));
+        }
+        buf.push(byte[0]);
+        if buf.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&buf)
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse::<u16>().ok())
+        .ok_or_else(|| io_err("malformed HTTP response"))
+}
+
+/// Best-effort error detail for a non-200 `/stream` response: those bodies are plain
+/// (non-chunked) JSON, and since we asked for `Connection: keep-alive` the server
+/// won't close the socket on its own, so a short timeout bounds the read.
+pub(crate) fn read_error_detail(mut stream: TcpStream) -> String {
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+    let mut body = String::new();
+    let _ = stream.read_to_string(&mut body);
+    serde_json::from_str::<Value>(&body)
+        .ok()
+        .and_then(|d| d.get("error").and_then(Value::as_str).map(str::to_string))
+        .unwrap_or_else(|| "(no detail)".into())
 }

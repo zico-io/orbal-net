@@ -1,21 +1,20 @@
 //! `orbal-net tui` (alias `watch`) - a live, read-only full-screen dashboard over an
-//! existing mission orbal-net server. It is NOT a mission agent: it reuses the same
-//! JSON-over-HTTP client as every other subcommand, reads globally (`agents` /
-//! `rooms`) and previews each room with `peek` (non-cursor-advancing) so it never
-//! eats messages real agents still need. The observer's own identity is filtered
-//! out of the displayed roster.
+//! existing mission orbal-net server. It is NOT a mission agent: it opens a single
+//! monitor-mode `POST /stream` connection (all relevant rooms + DMs) and renders
+//! whatever the server pushes - no polling, no `peek` calls. The observer's own
+//! identity is filtered out of the displayed roster.
 //!
 //! Module layout (the integration seam - keep these signatures stable):
-//!   mod.rs   - this file: shared model (Snapshot etc), Config, Client, thread wiring.
-//!   data.rs  - background poller: fills a shared Snapshot from the server; owns
-//!              server-health inference and reconnect.  `data::run(cfg, shared, stop)`.
+//!   mod.rs   - this file: shared model (Snapshot etc), Config, thread wiring.
+//!   data.rs  - background stream consumer: fills a shared Snapshot from the
+//!              `/stream` connection; owns server-health inference and reconnect.
+//!              `data::run(cfg, shared, stop, focus)`.
 //!   view.rs  - terminal lifecycle + ratatui render + input; sets `stop` on quit.
 //!              `view::run(cfg, shared, stop) -> io::Result<()>`.
 //!
 //! The two halves communicate ONLY through `Arc<Mutex<Snapshot>>` (data writes, view
 //! reads) and an `Arc<AtomicBool>` stop flag. Neither half calls the other directly.
 
-use serde_json::Value;
 use std::env;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -31,7 +30,8 @@ pub struct Config {
     pub token: String,
     /// Observer identity (ORBAL_NET_AGENT). Reads only; filtered from the roster view.
     pub agent: String,
-    /// Poll cadence for the background refresher.
+    /// Delay between reconnect attempts after the `/stream` connection drops (there
+    /// is no poll cadence anymore - `--interval` is repurposed as this backoff).
     pub interval: Duration,
 }
 
@@ -64,10 +64,11 @@ pub struct MsgView {
 
 /// A typed progress event (contract v1: 8 kinds - task-start/done/error/abort,
 /// step, phase, blocked, handoff). Lives in its own table server-side, so it is
-/// monitor-only by construction: no cursor, never consumed, always `since`-polled.
+/// monitor-only by construction: no cursor, never consumed, delivered as `progress`
+/// frames on the monitor `/stream` (resume tracked via the frame's composite `id`,
+/// not this row's own seq).
 #[derive(Clone, Debug)]
 pub struct EventView {
-    pub seq: i64,
     pub room: String,
     pub agent: String,
     pub kind: String,
@@ -148,70 +149,10 @@ impl Snapshot {
 }
 
 /// Room name the view wants drilled into, or `None` for the room list. Written by
-/// view.rs on Enter/Esc, read by data.rs's poller - the *only* way the view
-/// influences what data fetches, so "view never calls the server directly" holds.
+/// view.rs on Enter/Esc, read by data.rs's stream consumer to decide which room's
+/// buffered thread to publish - the *only* way the view influences what's shown, so
+/// "view never calls the server directly" holds.
 pub type FocusHandle = Arc<Mutex<Option<String>>>;
-
-/// Outcome of a single client call: distinguish "server unreachable" (transport error
-/// => Disconnected) from "server answered with an error status" (still Connected).
-pub enum CallError {
-    /// Could not reach the server at all (connect refused, timeout, malformed).
-    Transport(String),
-    /// Server answered but with a non-200 status.
-    Status { code: u16, detail: String },
-}
-
-impl std::fmt::Display for CallError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CallError::Transport(e) => write!(f, "{e}"),
-            CallError::Status { code, detail } => write!(f, "{code} {detail}"),
-        }
-    }
-}
-
-/// Thin reusable client over the crate's hand-rolled `http_post`. One instance is
-/// shared by the poller for all its reads.
-pub struct Client {
-    url: String,
-    token: String,
-    agent: String,
-    timeout: Duration,
-}
-
-impl Client {
-    pub fn new(cfg: &Config) -> Self {
-        Client {
-            url: cfg.url.clone(),
-            token: cfg.token.clone(),
-            agent: cfg.agent.clone(),
-            timeout: Duration::from_secs(15),
-        }
-    }
-
-    /// POST `action` with `fields` (the observer identity is injected as `agent`),
-    /// returning the parsed JSON body on 200. A transport failure maps to
-    /// `CallError::Transport` (=> the caller should mark the server Disconnected).
-    pub fn call(
-        &self,
-        action: &str,
-        mut fields: serde_json::Map<String, Value>,
-    ) -> Result<Value, CallError> {
-        fields.insert("agent".into(), Value::String(self.agent.clone()));
-        let payload = Value::Object(fields).to_string();
-        match crate::http_post(&self.url, &self.token, action, &payload, self.timeout) {
-            Ok((200, body)) => Ok(serde_json::from_str(&body).unwrap_or(Value::Null)),
-            Ok((code, body)) => {
-                let detail = serde_json::from_str::<Value>(&body)
-                    .ok()
-                    .and_then(|d| d.get("error").and_then(Value::as_str).map(str::to_string))
-                    .unwrap_or_else(|| "(no detail)".into());
-                Err(CallError::Status { code, detail })
-            }
-            Err(e) => Err(CallError::Transport(e.to_string())),
-        }
-    }
-}
 
 /// Entry point for `orbal-net tui` / `orbal-net watch`.
 pub fn run(args: &[String]) {
@@ -241,8 +182,8 @@ pub fn run(args: &[String]) {
     let stop = Arc::new(AtomicBool::new(false));
     let focus: FocusHandle = Arc::new(Mutex::new(None));
 
-    // Background poller fills `shared`; the view renders it on the main thread and
-    // flips `stop` when the user quits.
+    // Background stream consumer fills `shared`; the view renders it on the main
+    // thread and flips `stop` when the user quits.
     let poller = {
         let cfg = cfg.clone();
         let shared = Arc::clone(&shared);
@@ -268,7 +209,8 @@ pub fn run(args: &[String]) {
     }
 }
 
-/// Optional `--interval <secs>` flag (fractional seconds allowed).
+/// Optional `--interval <secs>` flag (fractional seconds allowed): reconnect backoff
+/// after the `/stream` connection drops, not a poll cadence.
 fn parse_interval(args: &[String]) -> Option<Duration> {
     let i = args.iter().position(|a| a == "--interval")?;
     let raw = args.get(i + 1)?;
