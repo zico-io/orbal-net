@@ -1051,6 +1051,13 @@ fn handle_stream(state: &State, request: tiny_http::Request, agent: String, body
             continue;
         }
 
+        // Test-only fault injection point: lets a test deterministically force a
+        // sender's commit+notify to land exactly here, between our DB-unlock (the
+        // query above found nothing) and the gen-lock/park below — the lost-wakeup
+        // window `gen_seen` exists to close. A no-op outside tests.
+        #[cfg(test)]
+        race_hook_pause_point();
+
         if last_activity.elapsed() >= KEEPALIVE_INTERVAL {
             if write_sse_comment(&mut writer, "keepalive").is_err() {
                 return;
@@ -1071,6 +1078,46 @@ fn handle_stream(state: &State, request: tiny_http::Request, agent: String, body
             continue;
         }
         let _ = state.cvar.wait_timeout(guard, remaining).unwrap();
+    }
+}
+
+/// Deterministic fault-injection rendezvous for `stream_lost_wakeup_regression`: when
+/// installed, `race_hook_pause_point` blocks the live loop at the exact lost-wakeup
+/// window until the test signals resume, so the test can force a competing
+/// commit+notify to land inside that window on every run instead of hoping OS
+/// scheduling happens to hit it. `None` (the default, and always outside tests) makes
+/// the pause point a no-op.
+#[cfg(test)]
+struct RaceHook {
+    paused_tx: std::sync::mpsc::Sender<()>,
+    resume_rx: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+#[cfg(test)]
+static RACE_HOOK: Mutex<Option<Arc<RaceHook>>> = Mutex::new(None);
+
+#[cfg(test)]
+fn install_race_hook() -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    *RACE_HOOK.lock().unwrap() = Some(Arc::new(RaceHook {
+        paused_tx,
+        resume_rx: Mutex::new(resume_rx),
+    }));
+    (paused_rx, resume_tx)
+}
+
+#[cfg(test)]
+fn clear_race_hook() {
+    *RACE_HOOK.lock().unwrap() = None;
+}
+
+#[cfg(test)]
+fn race_hook_pause_point() {
+    let hook = RACE_HOOK.lock().unwrap().clone();
+    if let Some(hook) = hook {
+        hook.paused_tx.send(()).ok();
+        hook.resume_rx.lock().unwrap().recv().ok();
     }
 }
 
@@ -1710,13 +1757,66 @@ mod tests {
         assert_eq!(unread["messages"][0]["text"], "hi");
     }
 
-    /// Regression for a lost-wakeup: the live loop must snapshot `gen` before reading
-    /// rows and re-check it right before parking, or a notify landing in the
-    /// DB-unlock-to-gen-lock window wakes nobody and the message falls back to the
-    /// keepalive timeout instead of notify latency. A single send-after-a-sleep (like
-    /// `stream_pushes_new_message_fast`) always lands after the stream is already
-    /// parked and can't hit that window; firing sends with no delay, repeated many
-    /// times, reliably does.
+    /// Deterministic regression for the lost-wakeup: `race_hook_pause_point` lets us
+    /// force a competing commit+notify to land exactly in the DB-unlock-to-gen-lock
+    /// window instead of hoping OS scheduling happens to hit it (empirically, plain
+    /// timing races essentially never do — the reader's window is a handful of
+    /// instructions, far smaller than any sender's round trip, so it almost always
+    /// wins the race to park first even under sustained concurrent load). This test
+    /// fails on the pre-fix code (message arrives only after the ~200ms cfg(test)
+    /// keepalive timeout) and passes on the fix (sub-tens-of-ms, notify-driven).
+    #[test]
+    fn stream_lost_wakeup_regression() {
+        let token = "t";
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn);
+        op_create_room(&conn, "alice", &json!({"name":"r"})).unwrap();
+        op_join(&conn, "bob", &json!({"room":"r"})).unwrap();
+        let (_state, port) = spawn_test_server(conn, token);
+
+        let mut client =
+            SseClient::connect(port, token, json!({"agent":"bob","mode":"recv","room":"r"}));
+        assert!(client.backfill().is_empty());
+
+        let (paused_rx, resume_tx) = install_race_hook();
+        // The live loop's idle-path pause point fires every iteration that finds
+        // nothing new; it may fire once or twice (each retried after a ~200ms
+        // keepalive) before landing here with the hook installed. Once it does, the
+        // stream thread is parked at exactly the lost-wakeup window.
+        paused_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("stream never reached the pause point");
+        post(
+            port,
+            token,
+            "send",
+            "alice",
+            json!({"room":"r","text":"raced"}),
+        );
+        // The send above has already committed and notify_all()'d by this point,
+        // strictly before the reader (still parked at the pause point) reaches its
+        // gen-lock/park call.
+        resume_tx.send(()).unwrap();
+
+        let start = Instant::now();
+        let (event, _id, data) = client.next_frame();
+        let elapsed = start.elapsed();
+        clear_race_hook();
+
+        assert_eq!(event, "message");
+        assert_eq!(data["text"], "raced");
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "elapsed {elapsed:?}: a lost wakeup falls back to the ~200ms cfg(test) keepalive \
+             timeout instead of being delivered at notify latency"
+        );
+    }
+
+    /// Non-deterministic companion to the above: repeated no-delay sends under
+    /// sustained load must keep every inter-frame gap well under the keepalive
+    /// interval. Doesn't reliably hit the exact lost-wakeup window on its own (see
+    /// `stream_lost_wakeup_regression` for why), but guards against any regression
+    /// that widens the race window enough for plain scheduling jitter to hit it.
     #[test]
     fn stream_repeated_no_sleep_send_never_falls_back_to_keepalive() {
         let token = "t";
