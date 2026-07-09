@@ -87,7 +87,12 @@ fn cli(port: u16, token: &str, agent: &str, args: &[&str]) -> Value {
 /// persisted cursor - never an explicit `--since` - so this exercises exactly the
 /// "next agent instance blocks for its next message" path real agents use.
 fn recv_texts(port: u16, token: &str, agent: &str, room: &str, timeout_secs: &str) -> Vec<String> {
-    let v = cli(port, token, agent, &["recv", room, "--timeout", timeout_secs]);
+    let v = cli(
+        port,
+        token,
+        agent,
+        &["recv", room, "--timeout", timeout_secs],
+    );
     v["messages"]
         .as_array()
         .unwrap_or_else(|| panic!("no messages array in {v}"))
