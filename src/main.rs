@@ -21,7 +21,9 @@
 //!   orbal-net send <room> <message...>
 //!   orbal-net dm <agent> <message...>
 //!   orbal-net read <room> [--since <seq>]
-//!   orbal-net wait <room> [--since <seq>] [--timeout <secs>]   # blocking long-poll read
+//!   orbal-net wait <room> [--since <seq>] [--timeout <secs>]   # deprecated, see recv
+//!   orbal-net recv <room> [--since <id>] [--timeout <secs>] [--follow]   # SSE-backed
+//!               blocking read; replaces wait (contract v1, mission-orbal-net-push)
 //!   orbal-net invite <room> <agent> | kick <room> <agent>
 //!   orbal-net event <room> <kind> [--task T] [--phase P] [--step N/M] [--percent P]
 //!               [--to AGENT] [--note <text...>]            # emit a progress event
@@ -54,7 +56,8 @@ orbal-net <subcommand> [args]
   dm <agent> <message...>
   read <room> [--since <seq>]
   peek <room> [--since <seq>]   # read without advancing your cursor (monitoring)
-  wait <room> [--since <seq>] [--timeout <secs>]
+  wait <room> [--since <seq>] [--timeout <secs>]   # deprecated, see recv
+  recv <room> [--since <id>] [--timeout <secs>] [--follow]   # SSE-backed; replaces wait
   invite <room> <agent> | kick <room> <agent>
   event <room> <kind> [--task T] [--phase P] [--step N/M] [--percent P] [--to AGENT] [--note <text...>]
     kinds: task-start | task-done | task-error | task-abort | step | phase | blocked | handoff
@@ -76,6 +79,7 @@ fn main() {
         }
         Some("serve") => server::run(&args[1..]),
         Some("tui") | Some("watch") => tui::run(&args[1..]),
+        Some("recv") => recv(&args[1..]),
         Some("--selfcheck") => match server::selfcheck() {
             Ok(()) => println!("orbal-net selfcheck ok"),
             Err(e) => die(format!("selfcheck failed: {e}")),
@@ -97,6 +101,53 @@ fn parse_opt(args: &[String], name: &str) -> (Option<String>, Vec<String>) {
     } else {
         (None, args.to_vec())
     }
+}
+
+/// Pull a bare `--name` flag out of args, returning (present, remaining args).
+fn parse_flag(args: &[String], name: &str) -> (bool, Vec<String>) {
+    if let Some(i) = args.iter().position(|a| a == name) {
+        let mut rest = args.to_vec();
+        rest.remove(i);
+        (true, rest)
+    } else {
+        (false, args.to_vec())
+    }
+}
+
+/// `orbal-net recv <room> [--since <id>] [--timeout <secs>] [--follow]` - SSE-backed
+/// replacement for `wait` (contract v1, mission-orbal-net-push wire contract seq 8).
+/// Phase A: argument parsing only. Phase B wires this to `POST /stream` once
+/// worker-server's endpoint lands: default behaves like `wait` (read until `: ready`;
+/// print `{room,messages:[...]}` if any arrived, else block for the first live
+/// message or `--timeout`, default 120s); `--follow` tails forever, one JSON line per
+/// message.
+fn recv(args: &[String]) {
+    let (since, args) = parse_opt(args, "--since");
+    let (timeout, args) = parse_opt(&args, "--timeout");
+    let (follow, args) = parse_flag(&args, "--follow");
+    if args.len() != 1 {
+        die("usage: orbal-net recv <room> [--since <id>] [--timeout <secs>] [--follow]");
+    }
+    let room = &args[0];
+    if let Some(s) = &since {
+        if sse::parse_since(s).is_none() {
+            die(format!(
+                "bad --since value {s:?}; want \"<msgSeq>:<evtSeq>\""
+            ));
+        }
+    }
+    let timeout_secs: u64 = timeout
+        .as_deref()
+        .map(|t| {
+            t.parse()
+                .unwrap_or_else(|_| die(format!("bad --timeout value {t:?}")))
+        })
+        .unwrap_or(120);
+
+    die(format!(
+        "orbal-net recv {room:?} (since={since:?}, timeout={timeout_secs}s, follow={follow}): \
+         not yet implemented - lands once worker-server's POST /stream is live"
+    ));
 }
 
 /// Split `--note <text...>` off the end of args: everything after `--note` is
