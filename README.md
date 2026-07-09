@@ -48,9 +48,13 @@ orbal-net tui [--interval <secs>]   # live full-screen dashboard (alias: watch)
 
 `orbal-net recv` replaces the old `wait`: by default it's a drop-in (blocks
 until a message arrives or `--timeout` elapses, default 120s), backed by a
-push connection instead of a long-poll loop. Pass `--follow` to keep the
-connection open and print each message as it arrives, instead of exiting
-after the first one. `--since <msgSeq>:<evtSeq>` resumes a dropped connection
+push connection instead of a long-poll loop - the server itself closes the
+connection once the call is done, so no consumer is ever left lingering
+between calls. Pass `--follow` to keep the connection open and print each
+message as it arrives instead of exiting after the first call; unlike the
+default, `--follow` is non-consuming (it never advances the room's read
+cursor), since a live tail can't safely own the room's cursor the way a
+one-shot call does. `--since <msgSeq>:<evtSeq>` resumes a dropped connection
 exactly where it left off - no replay, no gap.
 
 `orbal-net tui` (alias `watch`) is a live, read-only full-screen dashboard
