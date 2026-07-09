@@ -978,6 +978,14 @@ fn handle_stream(state: &State, request: tiny_http::Request, agent: String, body
 
     let mut last_activity = Instant::now();
     loop {
+        // Snapshot gen BEFORE reading rows: senders commit then bump gen+notify_all
+        // (see `handle`), so any row landing after this snapshot also bumps gen.
+        // Checking it again right before parking (below) closes the lost-wakeup window
+        // between releasing the DB lock here and taking the gen lock to park — without
+        // this, a notify landing in that window wakes nobody (this thread isn't parked
+        // yet) and the row would sit until the next keepalive timeout instead of being
+        // delivered at notify latency.
+        let gen_seen = *state.gen.lock().unwrap();
         let (msgs, evts, roster_opt) = {
             let conn = state.db.lock().unwrap();
             let scope = stream_scope(&conn, &agent, &room);
@@ -1057,6 +1065,11 @@ fn handle_stream(state: &State, request: tiny_http::Request, agent: String, body
             .saturating_sub(last_activity.elapsed())
             .max(Duration::from_millis(100));
         let guard = state.gen.lock().unwrap();
+        if *guard != gen_seen {
+            // A notify landed between our DB-unlock and this gen-lock: don't park on a
+            // Condvar nobody will signal again soon, loop straight back to re-query.
+            continue;
+        }
         let _ = state.cvar.wait_timeout(guard, remaining).unwrap();
     }
 }
@@ -1695,6 +1708,66 @@ mod tests {
         // monitor never advances bob's read cursor: bob's own recv/read still sees "hi".
         let unread = post(port, token, "read", "bob", json!({"room":"r","peek":true}));
         assert_eq!(unread["messages"][0]["text"], "hi");
+    }
+
+    /// Regression for a lost-wakeup: the live loop must snapshot `gen` before reading
+    /// rows and re-check it right before parking, or a notify landing in the
+    /// DB-unlock-to-gen-lock window wakes nobody and the message falls back to the
+    /// keepalive timeout instead of notify latency. A single send-after-a-sleep (like
+    /// `stream_pushes_new_message_fast`) always lands after the stream is already
+    /// parked and can't hit that window; firing sends with no delay, repeated many
+    /// times, reliably does.
+    #[test]
+    fn stream_repeated_no_sleep_send_never_falls_back_to_keepalive() {
+        let token = "t";
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn);
+        op_create_room(&conn, "alice", &json!({"name":"r"})).unwrap();
+        op_join(&conn, "bob", &json!({"room":"r"})).unwrap();
+        let (_state, port) = spawn_test_server(conn, token);
+
+        let mut client =
+            SseClient::connect(port, token, json!({"agent":"bob","mode":"recv","room":"r"}));
+        assert!(client.backfill().is_empty());
+
+        // A persistent sender hammering `send` back-to-back (no per-message spawn
+        // overhead, which would itself dwarf the race window) gives many chances for a
+        // notify to land in the tiny DB-unlock-to-gen-lock window each time the reader
+        // is about to park. A single delayed send (like `stream_pushes_new_message_fast`)
+        // never lands there; this does, repeatedly, over the run.
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done2 = Arc::clone(&done);
+        let sender = std::thread::spawn(move || {
+            let mut i: u64 = 0;
+            while !done2.load(std::sync::atomic::Ordering::Relaxed) {
+                post(
+                    port,
+                    token,
+                    "send",
+                    "alice",
+                    json!({"room":"r","text": format!("s{i}")}),
+                );
+                i += 1;
+            }
+        });
+
+        let mut max_gap = Duration::ZERO;
+        let mut last = Instant::now();
+        for _ in 0..300 {
+            let (event, _id, _data) = client.next_frame();
+            assert_eq!(event, "message");
+            let gap = last.elapsed();
+            max_gap = max_gap.max(gap);
+            last = Instant::now();
+        }
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        sender.join().unwrap();
+
+        assert!(
+            max_gap < Duration::from_millis(150),
+            "max inter-frame gap {max_gap:?} (KEEPALIVE_INTERVAL is 200ms under cfg(test)); \
+             a lost wakeup falls back to the keepalive timeout instead of notify latency"
+        );
     }
 
     /// Backfill/live boundary race: fire sends concurrently with the stream connecting
