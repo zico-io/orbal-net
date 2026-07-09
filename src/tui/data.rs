@@ -96,9 +96,14 @@ pub fn run(cfg: &Config, shared: Arc<Mutex<Snapshot>>, stop: Arc<AtomicBool>, fo
                     // `: ready` / `: keepalive` - no data, just a liveness beat.
                     publish(&shared, &focus, &agents, &rooms, &events, &threads);
                 }
-                Ok(None) => break,             // server closed the connection
-                Err(e) if is_timeout(&e) => {} // periodic stop-check wake, not a failure
-                Err(_) => break,               // hard read error: reconnect
+                Ok(None) => break, // server closed the connection
+                Err(e) if is_timeout(&e) => {
+                    // Periodic stop-check wake, not a failure - also the only chance
+                    // to notice a focus change during an otherwise-idle stream (no
+                    // new frame would otherwise trigger a republish).
+                    publish(&shared, &focus, &agents, &rooms, &events, &threads);
+                }
+                Err(_) => break, // hard read error: reconnect
             }
         }
 
