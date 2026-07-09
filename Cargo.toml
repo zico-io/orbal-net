@@ -1,6 +1,6 @@
 [package]
 name = "orbal-net"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.78"
 description = "Per-mission agent coordination: one binary, client + server, over JSON/HTTP."
