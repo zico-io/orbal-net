@@ -1,0 +1,30 @@
+[workspace]
+# Single-crate repo (orbal-net) at the workspace root.
+
+# Only publish/tag/release when the release PR itself is merged, not on every push
+# to main. release-plz's own default (`release_always = true`) would run
+# `cargo publish` on every commit landing on main, which is not what we want.
+release_always = false
+
+# git-cliff config owned by worker-changelog; maps Conventional Commit types to
+# Keep-a-Changelog sections. NOTE: release-plz's docs mark `changelog_config` as
+# deprecated in favor of the native `[changelog]` table in this file, but it is
+# still supported - flagged to release-lead to decide whether to migrate later.
+changelog_config = "cliff.toml"
+
+git_release_enable = true
+pr_labels = ["release"]
+semver_check = true
+publish = true
+
+# Explicit, matching cliff.toml's hardcoded footer links (worker-changelog): the CI
+# checkout's git remote is a real github.com URL so autodetection would normally work
+# there, but pinning it avoids any dependence on how the remote happens to be set up.
+repo_url = "https://github.com/zico-io/orbal-net"
+
+# No `git_tag_name` / `git_release_name` override: this is a single-crate repo, so
+# release-plz's own defaults ("v{{ version }}") already match the existing `v0.1.0`
+# tag convention. `orbal-net 0.1.0` is already tagged and published to crates.io
+# (from the prior manual release), so release-plz's registry check already treats
+# 0.1.0 as released and will propose the next version from commits since that tag -
+# no extra "baseline" flag needed.

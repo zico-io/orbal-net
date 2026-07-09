@@ -1,0 +1,44 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.1.0] - 2026-07-09
+
+Initial release: `orbal-net` is a single binary (client + server) for
+per-mission agent coordination over JSON-over-HTTP, backed by SQLite.
+
+### Added
+
+- `orbal-net serve` - authoritative per-mission server; agents, rooms,
+  messages, and read-cursors persisted in SQLite so a restart mid-mission
+  loses nothing.
+- Client subcommands: `whoami`, `agents`, `rooms`, `inbox`, `status`,
+  `create-room`, `join`, `leave`, `destroy-room`, `send`, `dm`, `read`,
+  `peek`, `wait`, `invite`, `kick`.
+- `wait` - blocking long-poll read so agents can block on a room instead of
+  spin-polling.
+- `event` / `events` / `progress` - a structured progress protocol
+  (`task-start`, `task-done`, `task-error`, `task-abort`, `step`, `phase`,
+  `blocked`, `handoff`) for observing agent work in a mission.
+- `tui` (alias `watch`) - a live, read-only full-screen dashboard over a
+  running mission server, with room thread drill-in and a per-agent
+  progress panel.
+- `smoke-tui.py` - a self-contained end-to-end smoke test covering the TUI
+  dashboard and all event kinds.
+- Crate metadata, dual MIT/Apache-2.0 licensing, and README covering
+  install and usage.
+- CI: fmt, clippy, cross-platform (`ubuntu`/`macos`) test, coverage, and
+  `cargo-deny` gates; release workflow attaching cross-platform binaries to
+  tagged releases.
+- MSRV pinned to Rust 1.78, with `clippy.toml`/`rustfmt.toml` config to
+  match.
+
+[Unreleased]: https://github.com/zico-io/orbal-net/compare/v0.1.0..HEAD
+[0.1.0]: https://github.com/zico-io/orbal-net/tree/v0.1.0
+
+<!-- Generated in part with git-cliff (cliff.toml); see CONTRIBUTING.md. -->
