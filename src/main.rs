@@ -36,12 +36,9 @@ use serde_json::{json, Value};
 use std::env;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod server;
-// TODO(orbal-net-push Phase B): wired into `recv`/tui stream consumers next; until
-// then nothing constructs these types and clippy's dead_code lint fires under -D warnings.
-#[allow(dead_code)]
 mod sse;
 mod tui;
 
@@ -114,13 +111,29 @@ fn parse_flag(args: &[String], name: &str) -> (bool, Vec<String>) {
     }
 }
 
+/// Read `ORBAL_NET_URL`/`ORBAL_NET_TOKEN`/`ORBAL_NET_AGENT`, or die with a usage
+/// hint if any are unset.
+fn env_triple() -> (String, String, String) {
+    match (
+        env::var("ORBAL_NET_URL").ok().filter(|s| !s.is_empty()),
+        env::var("ORBAL_NET_TOKEN").ok().filter(|s| !s.is_empty()),
+        env::var("ORBAL_NET_AGENT").ok().filter(|s| !s.is_empty()),
+    ) {
+        (Some(u), Some(t), Some(a)) => (u, t, a),
+        _ => die("ORBAL_NET_URL, ORBAL_NET_TOKEN and ORBAL_NET_AGENT must all be set"),
+    }
+}
+
 /// `orbal-net recv <room> [--since <id>] [--timeout <secs>] [--follow]` - SSE-backed
 /// replacement for `wait` (contract v1, mission-orbal-net-push wire contract seq 8).
-/// Phase A: argument parsing only. Phase B wires this to `POST /stream` once
-/// worker-server's endpoint lands: default behaves like `wait` (read until `: ready`;
-/// print `{room,messages:[...]}` if any arrived, else block for the first live
-/// message or `--timeout`, default 120s); `--follow` tails forever, one JSON line per
-/// message.
+/// Default is a drop-in for `wait`: read frames until `: ready`; if any messages
+/// arrived during backfill, print `{room,messages:[...]}` (same shape `wait`/`read`
+/// returned) and exit. If none, keep reading until the first live message (print+exit)
+/// or `--timeout` elapses (default 120s -> print `{room,messages:[]}`, exit).
+/// `--follow` stays open and prints one JSON line per message as it arrives
+/// (ignores `--timeout`; exits on signal). The server never advances any cursor but
+/// the room's own consuming read cursor, so a plain `recv` behaves exactly like the
+/// old `wait` from the caller's perspective.
 fn recv(args: &[String]) {
     let (since, args) = parse_opt(args, "--since");
     let (timeout, args) = parse_opt(&args, "--timeout");
@@ -128,7 +141,7 @@ fn recv(args: &[String]) {
     if args.len() != 1 {
         die("usage: orbal-net recv <room> [--since <id>] [--timeout <secs>] [--follow]");
     }
-    let room = &args[0];
+    let room = args[0].clone();
     if let Some(s) = &since {
         if sse::parse_since(s).is_none() {
             die(format!(
@@ -144,10 +157,77 @@ fn recv(args: &[String]) {
         })
         .unwrap_or(120);
 
-    die(format!(
-        "orbal-net recv {room:?} (since={since:?}, timeout={timeout_secs}s, follow={follow}): \
-         not yet implemented - lands once worker-server's POST /stream is live"
-    ));
+    let (url, token, agent) = env_triple();
+    let payload = json!({ "agent": agent, "mode": "recv", "room": room }).to_string();
+
+    let (code, stream) = open_stream(&url, &token, &payload, since.as_deref())
+        .unwrap_or_else(|e| die(format!("cannot reach {url} ({e})")));
+    if code != 200 {
+        die(format!("recv: {code} {}", read_error_detail(stream)));
+    }
+
+    // Bound each blocking read to what's left of the deadline by shrinking the shared
+    // socket's read timeout every iteration; `--follow` never sets one (blocks
+    // forever). `try_clone` shares the same OS socket, so this affects the reads
+    // `SseReader`/`ChunkedReader` do through the moved-in `stream` below.
+    let timeout_clone = stream
+        .try_clone()
+        .unwrap_or_else(|e| die(format!("recv: {e}")));
+    let deadline = (!follow).then(|| Instant::now() + Duration::from_secs(timeout_secs));
+
+    let mut reader = sse::SseReader::new(sse::ChunkedReader::new(stream));
+    let mut backfill_msgs: Vec<Value> = Vec::new();
+    let mut in_backfill = true;
+
+    loop {
+        if let Some(dl) = deadline {
+            let now = Instant::now();
+            if now >= dl {
+                print_messages(&room, Vec::new());
+                return;
+            }
+            timeout_clone.set_read_timeout(Some(dl - now)).ok();
+        }
+        match reader.next_event() {
+            Ok(Some(sse::SseEvent::Comment(c))) => {
+                if c == "ready" {
+                    in_backfill = false;
+                    if !backfill_msgs.is_empty() {
+                        print_messages(&room, backfill_msgs);
+                        return;
+                    }
+                }
+                // keepalive, or a bare "ready" with nothing yet: keep reading.
+            }
+            Ok(Some(sse::SseEvent::Frame { event, data, .. })) if event == "message" => {
+                let msg: Value = serde_json::from_str(&data).unwrap_or(Value::Null);
+                if follow {
+                    println!("{msg}");
+                } else if in_backfill {
+                    backfill_msgs.push(msg);
+                } else {
+                    print_messages(&room, vec![msg]);
+                    return;
+                }
+            }
+            Ok(Some(sse::SseEvent::Frame { .. })) => {} // not sent for mode=recv; ignore
+            Ok(None) => die("recv: server closed the stream"),
+            Err(e) if is_timeout(&e) => continue, // deadline check above handles expiry
+            Err(e) => die(format!("recv: {e}")),
+        }
+    }
+}
+
+fn is_timeout(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
+}
+
+fn print_messages(room: &str, messages: Vec<Value>) {
+    let out = json!({ "room": room, "messages": messages });
+    println!("{}", serde_json::to_string_pretty(&out).unwrap());
 }
 
 /// Split `--note <text...>` off the end of args: everything after `--note` is
@@ -416,4 +496,81 @@ pub(crate) fn http_post(
 
 fn io_err(msg: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg)
+}
+
+/// Open a persistent `POST /stream` SSE connection (`Connection: keep-alive`, unlike
+/// `http_post`'s one-shot `close`). Returns the response status code and the raw
+/// `TcpStream`, positioned right after the HTTP headers - the caller wraps it in
+/// `sse::ChunkedReader`/`sse::SseReader` on 200, or reads the (non-chunked) JSON error
+/// body directly on failure. `since` is sent as `Last-Event-ID`, the header the server
+/// checks first for resume (contract v1, wire contract seq 8).
+pub(crate) fn open_stream(
+    base: &str,
+    token: &str,
+    body: &str,
+    since: Option<&str>,
+) -> std::io::Result<(u16, TcpStream)> {
+    let rest = base
+        .trim()
+        .trim_end_matches('/')
+        .strip_prefix("http://")
+        .ok_or_else(|| io_err("ORBAL_NET_URL must start with http://"))?;
+    let (hostport, base_path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    let path = format!("{}/stream", base_path.trim_end_matches('/'));
+
+    let mut stream = TcpStream::connect(hostport)?;
+    let mut req = format!(
+        "POST {path} HTTP/1.1\r\nHost: {hostport}\r\nAuthorization: Bearer {token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n",
+        body.len()
+    );
+    if let Some(id) = since {
+        req.push_str(&format!("Last-Event-ID: {id}\r\n"));
+    }
+    req.push_str("\r\n");
+    req.push_str(body);
+    stream.write_all(req.as_bytes())?;
+
+    let code = read_status_line(&mut stream)?;
+    Ok((code, stream))
+}
+
+/// Read the HTTP status line + headers off `stream` one byte at a time (headers are a
+/// few hundred bytes at most, so simplicity beats buffering here - and a buffered read
+/// risks swallowing chunked-body bytes past the header boundary), returning the status
+/// code. Leaves `stream` positioned exactly at the start of the body.
+fn read_status_line(stream: &mut TcpStream) -> std::io::Result<u16> {
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let n = stream.read(&mut byte)?;
+        if n == 0 {
+            return Err(io_err("connection closed before headers"));
+        }
+        buf.push(byte[0]);
+        if buf.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&buf)
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse::<u16>().ok())
+        .ok_or_else(|| io_err("malformed HTTP response"))
+}
+
+/// Best-effort error detail for a non-200 `/stream` response: those bodies are plain
+/// (non-chunked) JSON, and since we asked for `Connection: keep-alive` the server
+/// won't close the socket on its own, so a short timeout bounds the read.
+fn read_error_detail(mut stream: TcpStream) -> String {
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+    let mut body = String::new();
+    let _ = stream.read_to_string(&mut body);
+    serde_json::from_str::<Value>(&body)
+        .ok()
+        .and_then(|d| d.get("error").and_then(Value::as_str).map(str::to_string))
+        .unwrap_or_else(|| "(no detail)".into())
 }

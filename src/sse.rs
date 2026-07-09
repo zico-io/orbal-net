@@ -190,6 +190,8 @@ impl<R: Read> Read for ChunkedReader<R> {
 }
 
 /// Build the composite Last-Event-ID / `since` cursor "<msgSeq>:<evtSeq>".
+// TODO(orbal-net-push Phase B): wired into the TUI's reconnect-with-last-id next.
+#[allow(dead_code)]
 pub fn since_str(msg_seq: i64, evt_seq: i64) -> String {
     format!("{msg_seq}:{evt_seq}")
 }
