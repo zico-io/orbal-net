@@ -37,6 +37,10 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 mod server;
+// TODO(orbal-net-push Phase B): wired into `recv`/tui stream consumers next; until
+// then nothing constructs these types and clippy's dead_code lint fires under -D warnings.
+#[allow(dead_code)]
+mod sse;
 mod tui;
 
 const USAGE: &str = "\
