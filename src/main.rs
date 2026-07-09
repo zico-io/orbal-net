@@ -565,7 +565,7 @@ fn read_status_line(stream: &mut TcpStream) -> std::io::Result<u16> {
 /// Best-effort error detail for a non-200 `/stream` response: those bodies are plain
 /// (non-chunked) JSON, and since we asked for `Connection: keep-alive` the server
 /// won't close the socket on its own, so a short timeout bounds the read.
-fn read_error_detail(mut stream: TcpStream) -> String {
+pub(crate) fn read_error_detail(mut stream: TcpStream) -> String {
     stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
     let mut body = String::new();
     let _ = stream.read_to_string(&mut body);

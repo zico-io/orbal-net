@@ -1,17 +1,21 @@
-//! Background poller: fills the shared `Snapshot` from the server. Owns server-health
-//! inference/reconnect and the per-room read cursor used for `peek` (never touches a
-//! real agent's cursor - `since` is always sent explicitly).
+//! Background stream consumer: fills the shared `Snapshot` from a single persistent
+//! `POST /stream` (monitor mode, all relevant rooms + DMs) instead of polling. Owns
+//! server-health inference and reconnect (with a composite `since` cursor, so a
+//! reconnect resumes exactly where the last connection left off - no replay, no gap).
 //!
-//! Each cycle: fetch `agents` + `rooms`, then `peek` every room for messages past its
-//! locally-tracked `since`. A transport failure on either `agents` or `rooms` marks the
-//! server Disconnected and freezes the displayed data at its last known-good value; a
-//! non-200 status still counts as Connected (the server answered).
+//! Everything the view needs - agents, rooms, the global progress ring, and the
+//! focused room's full thread - arrives as `message`/`progress`/`roster` frames on
+//! this one connection, so unlike the old poller there is no separate network call
+//! for the drill-in thread: every relevant room's messages+events are buffered
+//! locally (capped per room) as they arrive, and focusing a room just serves its
+//! buffer - switching focus never touches the network.
 
 use super::{
-    AgentView, CallError, Client, Config, EventView, FocusHandle, Health, MsgView, RoomThread,
-    RoomView, Snapshot, ThreadItem,
+    AgentView, Config, EventView, FocusHandle, Health, MsgView, RoomThread, RoomView, Snapshot,
+    ThreadItem,
 };
-use serde_json::{Map, Value};
+use crate::sse::{self, SseEvent};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -20,246 +24,207 @@ use std::time::{Duration, Instant};
 /// Cap on the global event ring kept in `Snapshot.events`, so a long-running
 /// observer's memory stays flat. Oldest events are dropped first.
 const EVENT_RING_CAP: usize = 2000;
+/// Cap on each room's buffered thread (messages+events merged), same idea as
+/// `EVENT_RING_CAP` but per room, so drill-in has bounded memory too.
+const ROOM_THREAD_CAP: usize = 500;
+/// How often a stalled read is unblocked to notice `stop` and re-check the deadline.
+const STOP_CHECK_INTERVAL: Duration = Duration::from_millis(300);
 
 pub fn run(cfg: &Config, shared: Arc<Mutex<Snapshot>>, stop: Arc<AtomicBool>, focus: FocusHandle) {
-    let client = Client::new(cfg);
-    // Room name -> next `since` to request. Lives here, not in Snapshot, so a peek
-    // never re-fetches (or advances any agent's real cursor for) messages already seen.
-    let mut last_seq: HashMap<String, i64> = HashMap::new();
-    let mut prev_agents: Vec<AgentView> = Vec::new();
-    let mut prev_rooms: Vec<RoomView> = Vec::new();
-    // Global event ring, oldest-first, capped at EVENT_RING_CAP.
+    let mut agents: Vec<AgentView> = Vec::new();
+    let mut rooms: Vec<RoomView> = Vec::new();
     let mut events: Vec<EventView> = Vec::new();
-    let mut events_since: i64 = 0;
-    // Focused-room thread accumulation. Reset whenever `focus` changes room.
-    let mut current_focus: Option<String> = None;
-    let mut thread_msg_since: i64 = 0;
-    let mut thread_evt_since: i64 = 0;
-    let mut thread_msgs: Vec<MsgView> = Vec::new();
-    let mut thread_evts: Vec<EventView> = Vec::new();
+    let mut threads: HashMap<String, Vec<ThreadItem>> = HashMap::new();
+    // Composite high-water mark, carried across reconnects so resuming never replays
+    // history already delivered nor misses anything committed while disconnected.
+    let mut last_msg: i64 = 0;
+    let mut last_evt: i64 = 0;
 
     while !stop.load(Ordering::SeqCst) {
-        let agents_res = client.call("agents", Map::new());
-        let rooms_res = client.call("rooms", Map::new());
+        set_health(&shared, Health::Connecting);
 
-        let transport_reason = match (&agents_res, &rooms_res) {
-            (Err(CallError::Transport(e)), _) => Some(e.clone()),
-            (_, Err(CallError::Transport(e))) => Some(e.clone()),
-            _ => None,
+        let since = sse::since_str(last_msg, last_evt);
+        let payload = serde_json::json!({ "agent": cfg.agent, "mode": "monitor" }).to_string();
+        let (code, tcp) = match crate::open_stream(&cfg.url, &cfg.token, &payload, Some(&since)) {
+            Ok(pair) => pair,
+            Err(e) => {
+                set_health(&shared, Health::Disconnected(e.to_string()));
+                sleep_responsive(cfg.interval, &stop);
+                continue;
+            }
         };
-
-        let (health, agents, rooms) = if let Some(reason) = transport_reason {
-            // Server unreachable: keep showing the last known-good data, just flag it.
-            (
-                Health::Disconnected(reason),
-                prev_agents.clone(),
-                prev_rooms.clone(),
-            )
-        } else {
-            let agents = match &agents_res {
-                Ok(v) => parse_agents(v),
-                Err(_) => prev_agents.clone(), // non-200 status: keep previous roster
-            };
-            let rooms = match &rooms_res {
-                Ok(v) => peek_rooms(&client, v, &mut last_seq, &prev_rooms),
-                Err(_) => prev_rooms.clone(),
-            };
-            (Health::Connected, agents, rooms)
+        if code != 200 {
+            let detail = crate::read_error_detail(tcp);
+            set_health(&shared, Health::Disconnected(format!("{code} {detail}")));
+            sleep_responsive(cfg.interval, &stop);
+            continue;
+        }
+        let Ok(timeout_handle) = tcp.try_clone() else {
+            set_health(
+                &shared,
+                Health::Disconnected("could not clone stream socket".into()),
+            );
+            sleep_responsive(cfg.interval, &stop);
+            continue;
         };
+        timeout_handle
+            .set_read_timeout(Some(STOP_CHECK_INTERVAL))
+            .ok();
 
-        prev_agents = agents.clone();
-        prev_rooms = rooms.clone();
+        set_health(&shared, Health::Connected);
+        let mut reader = sse::SseReader::new(sse::ChunkedReader::new(tcp));
 
-        // Global event ring: one incremental call per cycle feeds the whole
-        // progress panel. Tolerate a 404/non-200 (old server without /events) same
-        // as a failed per-room peek - it must never flip Health on its own.
-        if let Some(new_events) = poll_events(&client, None, events_since) {
-            for e in new_events {
-                events_since = events_since.max(e.seq);
-                events.push(e);
+        loop {
+            if stop.load(Ordering::SeqCst) {
+                return;
             }
-            if events.len() > EVENT_RING_CAP {
-                let drop = events.len() - EVENT_RING_CAP;
-                events.drain(0..drop);
-            }
-        }
-
-        // Focused-room drill-in: the view requests a room via `focus`; this is the
-        // only server-facing side of that feature; see mod.rs::FocusHandle.
-        let want_focus = focus.lock().unwrap().clone();
-        if want_focus != current_focus {
-            current_focus = want_focus;
-            thread_msg_since = 0;
-            thread_evt_since = 0;
-            thread_msgs.clear();
-            thread_evts.clear();
-        }
-        let thread = current_focus.as_ref().map(|room| {
-            if let Some(new_msgs) = poll_messages(&client, room, thread_msg_since) {
-                for m in new_msgs {
-                    thread_msg_since = thread_msg_since.max(m.0);
-                    thread_msgs.push(m.1);
+            match reader.next_event() {
+                Ok(Some(SseEvent::Frame { event, id, data })) => {
+                    if let Some((m, e)) = id.as_deref().and_then(sse::parse_since) {
+                        last_msg = last_msg.max(m);
+                        last_evt = last_evt.max(e);
+                    }
+                    match event.as_str() {
+                        "message" => handle_message(&data, &mut rooms, &mut threads),
+                        "progress" => handle_progress(&data, &mut events, &mut threads),
+                        "roster" => handle_roster(&data, &mut agents, &mut rooms),
+                        _ => {}
+                    }
+                    publish(&shared, &focus, &agents, &rooms, &events, &threads);
                 }
-            }
-            if let Some(new_evts) = poll_events(&client, Some(room.as_str()), thread_evt_since) {
-                for e in new_evts {
-                    thread_evt_since = thread_evt_since.max(e.seq);
-                    thread_evts.push(e);
+                Ok(Some(SseEvent::Comment(_))) => {
+                    // `: ready` / `: keepalive` - no data, just a liveness beat.
+                    publish(&shared, &focus, &agents, &rooms, &events, &threads);
                 }
+                Ok(None) => break,             // server closed the connection
+                Err(e) if is_timeout(&e) => {} // periodic stop-check wake, not a failure
+                Err(_) => break,               // hard read error: reconnect
             }
-            RoomThread {
-                room: room.clone(),
-                items: merge_thread(&thread_msgs, &thread_evts),
-            }
-        });
-
-        {
-            let mut snap = shared.lock().unwrap();
-            let connected = matches!(health, Health::Connected);
-            snap.health = health;
-            snap.agents = agents;
-            snap.rooms = rooms;
-            snap.events = events.clone();
-            snap.thread = thread;
-            if connected {
-                snap.last_update = Some(Instant::now());
-            }
-            snap.polls += 1;
         }
 
+        set_health(&shared, Health::Disconnected("stream closed".into()));
         sleep_responsive(cfg.interval, &stop);
     }
 }
 
-/// Non-consuming `/events` read. `room = None` fetches across all rooms (feeds the
-/// global progress ring); `room = Some(_)` filters to one room (feeds a drill-in
-/// thread). Returns `None` on any transport/status failure so the caller can just
-/// leave its accumulator untouched - an old server without `/events` must not
-/// affect Health, matching the existing per-room peek failure rule.
-fn poll_events(client: &Client, room: Option<&str>, since: i64) -> Option<Vec<EventView>> {
-    let mut fields = Map::new();
-    if let Some(r) = room {
-        fields.insert("room".into(), Value::String(r.to_string()));
-    }
-    fields.insert("since".into(), Value::from(since));
-    let resp = client.call("events", fields).ok()?;
-    let arr = resp.get("events").and_then(Value::as_array)?;
-    Some(arr.iter().filter_map(parse_event).collect())
-}
-
-/// Non-consuming `read` (peek) of a room's full backlog past `since`, for the
-/// drill-in thread. Returns `(seq, MsgView)` pairs so the caller can track its own
-/// `since` cursor without threading seq through `MsgView` itself.
-fn poll_messages(client: &Client, room: &str, since: i64) -> Option<Vec<(i64, MsgView)>> {
-    let mut fields = Map::new();
-    fields.insert("room".into(), Value::String(room.to_string()));
-    fields.insert("since".into(), Value::from(since));
-    fields.insert("peek".into(), Value::Bool(true));
-    let resp = client.call("read", fields).ok()?;
-    let arr = resp.get("messages").and_then(Value::as_array)?;
-    Some(
-        arr.iter()
-            .filter_map(|m| {
-                let seq = m.get("seq").and_then(Value::as_i64)?;
-                Some((seq, parse_msg(m)))
-            })
-            .collect(),
+fn is_timeout(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
     )
 }
 
-fn parse_msg(m: &Value) -> MsgView {
-    MsgView {
-        from: m
-            .get("from")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        text: m
-            .get("text")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        ts: m.get("ts").and_then(Value::as_i64),
-    }
+fn set_health(shared: &Mutex<Snapshot>, health: Health) {
+    shared.lock().unwrap().health = health;
 }
 
-fn parse_event(e: &Value) -> Option<EventView> {
-    Some(EventView {
-        seq: e.get("seq").and_then(Value::as_i64)?,
-        room: e
-            .get("room")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        agent: e
-            .get("agent")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        kind: e
-            .get("kind")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        task: e.get("task").and_then(Value::as_str).map(str::to_string),
-        phase: e.get("phase").and_then(Value::as_str).map(str::to_string),
-        step_cur: e.get("step_cur").and_then(Value::as_i64),
-        step_total: e.get("step_total").and_then(Value::as_i64),
-        percent: e.get("percent").and_then(Value::as_i64),
-        target: e.get("target").and_then(Value::as_str).map(str::to_string),
-        note: e.get("note").and_then(Value::as_str).map(str::to_string),
-        ts: e.get("ts").and_then(Value::as_i64).unwrap_or(0),
-    })
-}
-
-/// Merge a room's messages and events into one `ts`-ascending thread. Legacy
-/// messages with `ts = None` sort oldest-first; at equal `ts` a message sorts
-/// before an event (contract v1 tiebreak).
-fn merge_thread(msgs: &[MsgView], evts: &[EventView]) -> Vec<ThreadItem> {
-    let mut items: Vec<ThreadItem> = Vec::with_capacity(msgs.len() + evts.len());
-    items.extend(msgs.iter().cloned().map(ThreadItem::Msg));
-    items.extend(evts.iter().cloned().map(ThreadItem::Evt));
-    items.sort_by_key(|item| match item {
-        ThreadItem::Msg(m) => (m.ts.unwrap_or(i64::MIN), 0u8),
-        ThreadItem::Evt(e) => (e.ts, 1u8),
+/// Push the current in-memory state into the shared `Snapshot`. Cloning agents/rooms/
+/// events every frame is the same trade the old poller made every cycle - fine at
+/// mission-scale message rates, and simpler than diffing.
+fn publish(
+    shared: &Mutex<Snapshot>,
+    focus: &FocusHandle,
+    agents: &[AgentView],
+    rooms: &[RoomView],
+    events: &[EventView],
+    threads: &HashMap<String, Vec<ThreadItem>>,
+) {
+    let want_focus = focus.lock().unwrap().clone();
+    let thread = want_focus.map(|room| {
+        let items = threads.get(&room).cloned().unwrap_or_default();
+        RoomThread {
+            room,
+            items: merge_thread_items(&items),
+        }
     });
-    items
+
+    let mut snap = shared.lock().unwrap();
+    snap.health = Health::Connected;
+    snap.agents = agents.to_vec();
+    snap.rooms = rooms.to_vec();
+    snap.events = events.to_vec();
+    snap.thread = thread;
+    snap.last_update = Some(Instant::now());
+    snap.polls += 1;
 }
 
-fn parse_agents(v: &Value) -> Vec<AgentView> {
-    v.get("agents")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|a| {
-                    let id = a.get("id").and_then(Value::as_str)?.to_string();
-                    let status = a
-                        .get("status")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    Some(AgentView { id, status })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+/// One `message` frame: `{"seq":N,"room":"...","from":"...","text":"...","ts":<ms|null>}`.
+/// DM channels (`room` starting with `@`) are filtered out - the room panel has never
+/// shown DMs (the old poller only ever peeked named rooms from `rooms`, never `inbox`).
+fn handle_message(
+    data: &str,
+    rooms: &mut Vec<RoomView>,
+    threads: &mut HashMap<String, Vec<ThreadItem>>,
+) {
+    let Ok(v) = serde_json::from_str::<Value>(data) else {
+        return;
+    };
+    let Some(room) = v.get("room").and_then(Value::as_str) else {
+        return;
+    };
+    if room.starts_with('@') {
+        return;
+    }
+    let room = room.to_string();
+    let msg = parse_msg(&v);
+
+    match rooms.iter_mut().find(|r| r.name == room) {
+        Some(r) => {
+            r.total_seen += 1;
+            r.last = Some(msg.clone());
+        }
+        // A message can arrive before the first `roster` frame populates this room's
+        // metadata (backfill sends messages, then events, then roster). Seed a bare
+        // entry now; the next roster carries its rtype/owner/members forward onto it.
+        None => rooms.push(RoomView {
+            name: room.clone(),
+            rtype: String::new(),
+            owner: String::new(),
+            members: Vec::new(),
+            total_seen: 1,
+            last: Some(msg.clone()),
+        }),
+    }
+    push_thread_item(threads, &room, ThreadItem::Msg(msg));
 }
 
-/// Build the room list from a `rooms` response, then `peek` each room for messages past
-/// its tracked `since`, carrying `total_seen`/`last` forward from `prev_rooms` (by name)
-/// so a room with no new activity this cycle keeps its prior preview instead of blanking.
-fn peek_rooms(
-    client: &Client,
-    rooms_json: &Value,
-    last_seq: &mut HashMap<String, i64>,
-    prev_rooms: &[RoomView],
-) -> Vec<RoomView> {
-    let arr = rooms_json
+/// One `progress` frame: same column shape as the old `/events` read.
+fn handle_progress(
+    data: &str,
+    events: &mut Vec<EventView>,
+    threads: &mut HashMap<String, Vec<ThreadItem>>,
+) {
+    let Ok(v) = serde_json::from_str::<Value>(data) else {
+        return;
+    };
+    let Some(ev) = parse_event(&v) else {
+        return;
+    };
+    let room = ev.room.clone();
+    events.push(ev.clone());
+    if events.len() > EVENT_RING_CAP {
+        let drop = events.len() - EVENT_RING_CAP;
+        events.drain(0..drop);
+    }
+    push_thread_item(threads, &room, ThreadItem::Evt(ev));
+}
+
+/// One `roster` frame: `{"agents":[{id,status}...],"rooms":[{name,type,owner,members}...]}`.
+/// Rebuilds the room list from scratch (so a destroyed room disappears), carrying
+/// forward `total_seen`/`last` from the current list by name, same merge the old
+/// poller did across polling cycles.
+fn handle_roster(data: &str, agents: &mut Vec<AgentView>, rooms: &mut Vec<RoomView>) {
+    let Ok(v) = serde_json::from_str::<Value>(data) else {
+        return;
+    };
+    *agents = parse_agents(&v);
+
+    let arr = v
         .get("rooms")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let mut out = Vec::with_capacity(arr.len());
+    let mut merged = Vec::with_capacity(arr.len());
     for r in arr {
         let name = r
             .get("name")
@@ -286,32 +251,10 @@ fn peek_rooms(
             })
             .unwrap_or_default();
 
-        let prev = prev_rooms.iter().find(|p| p.name == name);
-        let mut total_seen = prev.map(|p| p.total_seen).unwrap_or(0);
-        let mut last = prev.and_then(|p| p.last.clone());
-
-        let since = *last_seq.get(&name).unwrap_or(&0);
-        let mut fields = Map::new();
-        fields.insert("room".into(), Value::String(name.clone()));
-        fields.insert("since".into(), Value::from(since));
-        fields.insert("peek".into(), Value::Bool(true));
-
-        // A peek failure here just leaves this room's total_seen/last as they were -
-        // the overall Health signal comes from the agents/rooms calls, not this one.
-        if let Ok(resp) = client.call("read", fields) {
-            if let Some(msgs) = resp.get("messages").and_then(Value::as_array) {
-                if !msgs.is_empty() {
-                    total_seen += msgs.len() as u64;
-                    if let Some(m) = msgs.last() {
-                        let seq = m.get("seq").and_then(Value::as_i64).unwrap_or(since);
-                        last_seq.insert(name.clone(), seq);
-                        last = Some(parse_msg(m));
-                    }
-                }
-            }
-        }
-
-        out.push(RoomView {
+        let prev = rooms.iter().find(|p| p.name == name);
+        let total_seen = prev.map(|p| p.total_seen).unwrap_or(0);
+        let last = prev.and_then(|p| p.last.clone());
+        merged.push(RoomView {
             name,
             rtype,
             owner,
@@ -320,11 +263,97 @@ fn peek_rooms(
             last,
         });
     }
-    out
+    *rooms = merged;
 }
 
-/// Sleep `interval`, but in short chunks so `stop` is noticed promptly (a quit shouldn't
-/// have to wait out a multi-second poll interval).
+fn push_thread_item(threads: &mut HashMap<String, Vec<ThreadItem>>, room: &str, item: ThreadItem) {
+    let buf = threads.entry(room.to_string()).or_default();
+    buf.push(item);
+    if buf.len() > ROOM_THREAD_CAP {
+        let drop = buf.len() - ROOM_THREAD_CAP;
+        buf.drain(0..drop);
+    }
+}
+
+/// Sort a room's buffered messages+events into one `ts`-ascending thread. Legacy
+/// messages with `ts = None` sort oldest-first; at equal `ts` a message sorts before
+/// an event (contract v1 tiebreak) - needed because the two frame kinds arrive on
+/// independent seq spaces and aren't guaranteed interleaved in `ts` order.
+fn merge_thread_items(items: &[ThreadItem]) -> Vec<ThreadItem> {
+    let mut v = items.to_vec();
+    v.sort_by_key(|item| match item {
+        ThreadItem::Msg(m) => (m.ts.unwrap_or(i64::MIN), 0u8),
+        ThreadItem::Evt(e) => (e.ts, 1u8),
+    });
+    v
+}
+
+fn parse_msg(m: &Value) -> MsgView {
+    MsgView {
+        from: m
+            .get("from")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        text: m
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        ts: m.get("ts").and_then(Value::as_i64),
+    }
+}
+
+fn parse_event(e: &Value) -> Option<EventView> {
+    e.get("seq").and_then(Value::as_i64)?; // sanity-check: a well-formed row has one
+    Some(EventView {
+        room: e
+            .get("room")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        agent: e
+            .get("agent")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        kind: e
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        task: e.get("task").and_then(Value::as_str).map(str::to_string),
+        phase: e.get("phase").and_then(Value::as_str).map(str::to_string),
+        step_cur: e.get("step_cur").and_then(Value::as_i64),
+        step_total: e.get("step_total").and_then(Value::as_i64),
+        percent: e.get("percent").and_then(Value::as_i64),
+        target: e.get("target").and_then(Value::as_str).map(str::to_string),
+        note: e.get("note").and_then(Value::as_str).map(str::to_string),
+        ts: e.get("ts").and_then(Value::as_i64).unwrap_or(0),
+    })
+}
+
+fn parse_agents(v: &Value) -> Vec<AgentView> {
+    v.get("agents")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|a| {
+                    let id = a.get("id").and_then(Value::as_str)?.to_string();
+                    let status = a
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    Some(AgentView { id, status })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Sleep `interval` (repurposed as the reconnect backoff - there is no poll cadence
+/// anymore), but in short chunks so `stop` is noticed promptly.
 fn sleep_responsive(interval: Duration, stop: &AtomicBool) {
     let chunk = Duration::from_millis(100);
     let mut remaining = interval;
@@ -335,5 +364,137 @@ fn sleep_responsive(interval: Duration, stop: &AtomicBool) {
         let step = remaining.min(chunk);
         std::thread::sleep(step);
         remaining = remaining.saturating_sub(step);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg_data(room: &str, from: &str, text: &str, ts: i64) -> String {
+        serde_json::json!({"seq": 1, "room": room, "from": from, "text": text, "ts": ts})
+            .to_string()
+    }
+
+    #[test]
+    fn handle_message_seeds_and_updates_room() {
+        let mut rooms = Vec::new();
+        let mut threads = HashMap::new();
+        handle_message(&msg_data("r", "alice", "hi", 100), &mut rooms, &mut threads);
+        assert_eq!(rooms.len(), 1);
+        assert_eq!(rooms[0].total_seen, 1);
+        assert_eq!(rooms[0].last.as_ref().unwrap().text, "hi");
+
+        handle_message(&msg_data("r", "bob", "yo", 200), &mut rooms, &mut threads);
+        assert_eq!(rooms.len(), 1, "same room, no duplicate entry");
+        assert_eq!(rooms[0].total_seen, 2);
+        assert_eq!(rooms[0].last.as_ref().unwrap().text, "yo");
+        assert_eq!(threads.get("r").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn handle_message_filters_dm_channels() {
+        let mut rooms = Vec::new();
+        let mut threads = HashMap::new();
+        handle_message(
+            &msg_data("@alice|bob", "alice", "psst", 100),
+            &mut rooms,
+            &mut threads,
+        );
+        assert!(rooms.is_empty());
+        assert!(threads.is_empty());
+    }
+
+    #[test]
+    fn handle_roster_carries_forward_preview_and_drops_destroyed_rooms() {
+        let mut rooms = Vec::new();
+        let mut threads = HashMap::new();
+        handle_message(&msg_data("r", "alice", "hi", 100), &mut rooms, &mut threads);
+
+        let mut agents = Vec::new();
+        let roster = serde_json::json!({
+            "agents": [{"id": "alice", "status": "active"}],
+            "rooms": [{"name": "r", "type": "public", "owner": "alice", "members": ["alice"]}],
+        })
+        .to_string();
+        handle_roster(&roster, &mut agents, &mut rooms);
+
+        assert_eq!(agents.len(), 1);
+        assert_eq!(rooms.len(), 1);
+        assert_eq!(rooms[0].rtype, "public");
+        assert_eq!(rooms[0].owner, "alice");
+        assert_eq!(rooms[0].total_seen, 1, "preview carried forward");
+        assert_eq!(rooms[0].last.as_ref().unwrap().text, "hi");
+
+        // A second roster that omits "r" (destroyed) must drop it, even though its
+        // preview data is still sitting in the pre-roster state.
+        let roster2 = serde_json::json!({"agents": [], "rooms": []}).to_string();
+        handle_roster(&roster2, &mut agents, &mut rooms);
+        assert!(rooms.is_empty());
+    }
+
+    #[test]
+    fn handle_progress_feeds_global_ring_and_room_thread() {
+        let mut events = Vec::new();
+        let mut threads = HashMap::new();
+        let data = serde_json::json!({
+            "seq": 1, "room": "r", "agent": "alice", "kind": "phase",
+            "phase": "building", "ts": 500,
+        })
+        .to_string();
+        handle_progress(&data, &mut events, &mut threads);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].phase.as_deref(), Some("building"));
+        assert_eq!(threads.get("r").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn event_ring_and_room_thread_are_capped() {
+        let mut events = Vec::new();
+        let mut threads = HashMap::new();
+        for i in 0..(EVENT_RING_CAP + 10) {
+            let data = serde_json::json!({
+                "seq": i, "room": "r", "agent": "a", "kind": "step",
+                "step_cur": i, "step_total": 1, "ts": i as i64,
+            })
+            .to_string();
+            handle_progress(&data, &mut events, &mut threads);
+        }
+        assert_eq!(events.len(), EVENT_RING_CAP);
+        assert_eq!(events[0].step_cur, Some(10), "oldest 10 dropped");
+        assert_eq!(threads.get("r").unwrap().len(), ROOM_THREAD_CAP);
+    }
+
+    #[test]
+    fn merge_thread_items_sorts_by_ts_with_message_before_event_tiebreak() {
+        let items = vec![
+            ThreadItem::Evt(EventView {
+                room: "r".into(),
+                agent: "a".into(),
+                kind: "phase".into(),
+                task: None,
+                phase: Some("p".into()),
+                step_cur: None,
+                step_total: None,
+                percent: None,
+                target: None,
+                note: None,
+                ts: 100,
+            }),
+            ThreadItem::Msg(MsgView {
+                from: "alice".into(),
+                text: "hi".into(),
+                ts: Some(100),
+            }),
+            ThreadItem::Msg(MsgView {
+                from: "bob".into(),
+                text: "legacy".into(),
+                ts: None,
+            }),
+        ];
+        let sorted = merge_thread_items(&items);
+        assert!(matches!(&sorted[0], ThreadItem::Msg(m) if m.text == "legacy"));
+        assert!(matches!(&sorted[1], ThreadItem::Msg(m) if m.text == "hi"));
+        assert!(matches!(&sorted[2], ThreadItem::Evt(_)));
     }
 }
