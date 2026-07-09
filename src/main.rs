@@ -6,8 +6,9 @@
 //! persisted in SQLite so a server restart mid-mission loses nothing.
 //!
 //! Transport is JSON-over-HTTP, one path per action, Bearer-token auth (the server
-//! binds 0.0.0.0 so local-NAT + remote containers can dial in). The client reads its
-//! target and identity from the environment:
+//! binds 0.0.0.0 so local-NAT + remote containers can dial in) - except `recv` and
+//! the TUI, which hold one persistent `POST /stream` (server-sent events) connection
+//! instead of polling. The client reads its target and identity from the environment:
 //!
 //!   ORBAL_NET_URL    base URL of the mission's server, e.g. http://10.0.0.4:54123
 //!   ORBAL_NET_TOKEN  the mission's bearer token
@@ -21,9 +22,8 @@
 //!   orbal-net send <room> <message...>
 //!   orbal-net dm <agent> <message...>
 //!   orbal-net read <room> [--since <seq>]
-//!   orbal-net wait <room> [--since <seq>] [--timeout <secs>]   # deprecated, see recv
 //!   orbal-net recv <room> [--since <id>] [--timeout <secs>] [--follow]   # SSE-backed
-//!               blocking read; replaces wait (contract v1, mission-orbal-net-push)
+//!               blocking read (contract v1, mission-orbal-net-push)
 //!   orbal-net invite <room> <agent> | kick <room> <agent>
 //!   orbal-net event <room> <kind> [--task T] [--phase P] [--step N/M] [--percent P]
 //!               [--to AGENT] [--note <text...>]            # emit a progress event
@@ -53,8 +53,7 @@ orbal-net <subcommand> [args]
   dm <agent> <message...>
   read <room> [--since <seq>]
   peek <room> [--since <seq>]   # read without advancing your cursor (monitoring)
-  wait <room> [--since <seq>] [--timeout <secs>]   # deprecated, see recv
-  recv <room> [--since <id>] [--timeout <secs>] [--follow]   # SSE-backed; replaces wait
+  recv <room> [--since <id>] [--timeout <secs>] [--follow]   # SSE-backed blocking read
   invite <room> <agent> | kick <room> <agent>
   event <room> <kind> [--task T] [--phase P] [--step N/M] [--percent P] [--to AGENT] [--note <text...>]
     kinds: task-start | task-done | task-error | task-abort | step | phase | blocked | handoff
@@ -261,9 +260,8 @@ fn client(argv: &[String]) {
     let wire_action = if cmd == "progress" { "event" } else { cmd };
     let rest: Vec<String> = argv[1..].to_vec();
 
-    // (action, body-fields, is_wait) — body always gets "agent" added by post().
+    // body always gets "agent" added below.
     let mut body = serde_json::Map::new();
-    let mut is_wait = false;
 
     match cmd {
         "whoami" | "agents" | "rooms" | "inbox" => {}
@@ -316,21 +314,6 @@ fn client(argv: &[String]) {
             if cmd == "peek" {
                 body.insert("peek".into(), json!(true));
             }
-        }
-        "wait" => {
-            let (since, rest) = parse_opt(&rest, "--since");
-            let (timeout, rest) = parse_opt(&rest, "--timeout");
-            if rest.len() != 1 {
-                die("usage: orbal-net wait <room> [--since <seq>] [--timeout <secs>]");
-            }
-            body.insert("room".into(), json!(rest[0]));
-            if let Some(s) = since {
-                body.insert("since".into(), json!(s));
-            }
-            if let Some(t) = &timeout {
-                body.insert("timeout".into(), json!(t));
-            }
-            is_wait = true;
         }
         "invite" | "kick" => {
             if rest.len() != 2 {
@@ -418,25 +401,11 @@ fn client(argv: &[String]) {
         )),
     }
 
-    let url = env::var("ORBAL_NET_URL").ok();
-    let token = env::var("ORBAL_NET_TOKEN").ok();
-    let agent = env::var("ORBAL_NET_AGENT").ok();
-    let (url, token, agent) = match (url, token, agent) {
-        (Some(u), Some(t), Some(a)) if !u.is_empty() && !t.is_empty() && !a.is_empty() => (u, t, a),
-        _ => die("ORBAL_NET_URL, ORBAL_NET_TOKEN and ORBAL_NET_AGENT must all be set"),
-    };
+    let (url, token, agent) = env_triple();
     body.insert("agent".into(), json!(agent));
     let payload = Value::Object(body).to_string();
 
-    // `wait` long-polls: give the read a generous ceiling above the server's own
-    // timeout so a normal return arrives, but a dead network still fails eventually.
-    let read_timeout = if is_wait {
-        Duration::from_secs(600)
-    } else {
-        Duration::from_secs(30)
-    };
-
-    match http_post(&url, &token, wire_action, &payload, read_timeout) {
+    match http_post(&url, &token, wire_action, &payload, Duration::from_secs(30)) {
         Ok((code, body)) => {
             let doc: Value = serde_json::from_str(&body).unwrap_or(json!({ "raw": body }));
             if code == 200 {
