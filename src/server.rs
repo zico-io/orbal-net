@@ -485,12 +485,23 @@ fn relevant_rooms(conn: &Connection, agent: &str) -> Vec<String> {
     keys
 }
 
-/// Room-key scope for a `/stream` connection: the explicit `room` if given, else
-/// every room the agent is a member of plus its DM channels (same set `inbox` uses).
-fn stream_scope(conn: &Connection, agent: &str, room: &Option<String>) -> Vec<String> {
+/// Every room name in the `rooms` table (no DM channels). The scope a monitor with no
+/// `room` filter uses — matches the pre-SSE poller's `/rooms` + peek-every-room, which
+/// was unscoped by membership (rooms are public; DMs were never surfaced to the TUI).
+fn all_room_names(conn: &Connection) -> Vec<String> {
+    let mut stmt = conn.prepare("SELECT name FROM rooms").unwrap();
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+    rows.map(|r| r.unwrap()).collect()
+}
+
+/// Room-key scope for a `/stream` connection: the explicit `room` if given, else every
+/// existing room (global, not membership-scoped — see `all_room_names`). `agent` is
+/// unused here but kept for symmetry with the per-agent `relevant_rooms` this replaced
+/// (a monitor watching everything, e.g. the TUI, never joins any room itself).
+fn stream_scope(conn: &Connection, _agent: &str, room: &Option<String>) -> Vec<String> {
     match room {
         Some(r) => vec![r.clone()],
-        None => relevant_rooms(conn, agent),
+        None => all_room_names(conn),
     }
 }
 
@@ -1720,10 +1731,11 @@ mod tests {
         init_schema(&conn);
         op_create_room(&conn, "alice", &json!({"name":"r"})).unwrap();
         op_join(&conn, "bob", &json!({"room":"r"})).unwrap();
-        op_join(&conn, "watcher", &json!({"room":"r"})).unwrap();
         op_send(&conn, "alice", &json!({"room":"r","text":"hi"})).unwrap();
         let (_state, port) = spawn_test_server(conn, token);
 
+        // "watcher" never joins "r": a monitor with no room filter must still see every
+        // room globally (see stream_monitor_default_scope_is_global_not_membership).
         let mut client =
             SseClient::connect(port, token, json!({"agent":"watcher","mode":"monitor"}));
         let backfilled = client.backfill();
@@ -1755,6 +1767,44 @@ mod tests {
         // monitor never advances bob's read cursor: bob's own recv/read still sees "hi".
         let unread = post(port, token, "read", "bob", json!({"room":"r","peek":true}));
         assert_eq!(unread["messages"][0]["text"], "hi");
+    }
+
+    /// Monitor's default scope (`room` omitted) is every existing room, not the
+    /// requesting agent's memberships — matching the pre-SSE TUI poller, which fetched
+    /// `/rooms` unscoped and peeked every one of them. The TUI's `observer` identity
+    /// never joins any room (see smoke-tui.py), so member-scoping here would silently
+    /// blank the whole dashboard; global-by-default is required, not just nicer. DM
+    /// channels are excluded from the default (the old poller never surfaced them
+    /// either) — a DM only shows up in monitor mode via an explicit `room`.
+    #[test]
+    fn stream_monitor_default_scope_is_global_not_membership() {
+        let token = "t";
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn);
+        op_create_room(&conn, "alice", &json!({"name":"r1"})).unwrap();
+        op_create_room(&conn, "carol", &json!({"name":"r2"})).unwrap();
+        op_send(&conn, "alice", &json!({"room":"r1","text":"m1"})).unwrap();
+        op_send(&conn, "carol", &json!({"room":"r2","text":"m2"})).unwrap();
+        op_dm(&conn, "alice", &json!({"to":"carol","text":"secret"})).unwrap();
+        let (_state, port) = spawn_test_server(conn, token);
+
+        // "observer" is a member of neither r1 nor r2, and no DM channel names it.
+        let mut client =
+            SseClient::connect(port, token, json!({"agent":"observer","mode":"monitor"}));
+        let backfilled = client.backfill();
+        let texts: Vec<&str> = backfilled
+            .iter()
+            .filter(|(ev, _, _)| ev == "message")
+            .map(|(_, _, d)| d["text"].as_str().unwrap())
+            .collect();
+        assert!(
+            texts.contains(&"m1") && texts.contains(&"m2"),
+            "non-member monitor sees every room's backlog: got {texts:?}"
+        );
+        assert!(
+            !texts.contains(&"secret"),
+            "default monitor scope excludes DM channels, matching the old poller: got {texts:?}"
+        );
     }
 
     /// Deterministic regression for the lost-wakeup: `race_hook_pause_point` lets us
