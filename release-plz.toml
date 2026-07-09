@@ -17,6 +17,11 @@ pr_labels = ["release"]
 semver_check = true
 publish = true
 
+# Explicit, matching cliff.toml's hardcoded footer links (worker-changelog): the CI
+# checkout's git remote is a real github.com URL so autodetection would normally work
+# there, but pinning it avoids any dependence on how the remote happens to be set up.
+repo_url = "https://github.com/zico-io/orbal-net"
+
 # No `git_tag_name` / `git_release_name` override: this is a single-crate repo, so
 # release-plz's own defaults ("v{{ version }}") already match the existing `v0.1.0`
 # tag convention. `orbal-net 0.1.0` is already tagged and published to crates.io
