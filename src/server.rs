@@ -1,4 +1,4 @@
-//! The `comms serve` server: SQLite-backed store + threaded JSON-over-HTTP handler.
+//! The `orbal-net serve` server: SQLite-backed store + threaded JSON-over-HTTP handler.
 //!
 //! One `rusqlite::Connection` behind a Mutex is the whole coordination store (the 1:1
 //! analog of the previous single `threading.Lock`). A Condvar lets `wait` block until a
@@ -151,7 +151,7 @@ fn init_schema(conn: &Connection) {
     .expect("init schema");
 
     // Migration: older databases have a `messages` table with no `ts` column.
-    // Additive-only (existing rows keep ts = NULL) so a pre-existing comms.db
+    // Additive-only (existing rows keep ts = NULL) so a pre-existing orbal-net.db
     // opens unchanged.
     let has_ts: bool = conn
         .prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name='ts'")
@@ -186,7 +186,7 @@ fn handle(state: &State, mut request: tiny_http::Request) {
             return reply(
                 request,
                 400,
-                json!({ "error": "missing 'agent' (set COMMS_AGENT)" }),
+                json!({ "error": "missing 'agent' (set ORBAL_NET_AGENT)" }),
             )
         }
     };
@@ -736,13 +736,13 @@ fn op_wait(state: &State, agent: &str, b: &Value) -> OpResult {
 }
 
 fn fail(msg: &str) -> ! {
-    eprintln!("comms serve: {msg}");
+    eprintln!("orbal-net serve: {msg}");
     std::process::exit(1);
 }
 
 // --- self-check ------------------------------------------------------------
 
-/// In-process integration check exercised by `comms --selfcheck` and `cargo test`.
+/// In-process integration check exercised by `orbal-net --selfcheck` and `cargo test`.
 /// Spins a real server on 127.0.0.1 and drives it through the client HTTP path.
 pub fn selfcheck() -> Result<(), String> {
     use std::net::TcpStream;

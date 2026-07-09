@@ -1,13 +1,17 @@
 [package]
-name = "comms"
+name = "orbal-net"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.78"
 description = "Per-mission agent coordination: one binary, client + server, over JSON/HTTP."
-publish = false
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zico-io/orbal-net"
+readme = "README.md"
+keywords = ["agent", "coordination", "multi-agent", "cli", "orchestration"]
+categories = ["command-line-utilities", "network-programming"]
 
 [[bin]]
-name = "comms"
+name = "orbal-net"
 path = "src/main.rs"
 
 [dependencies]

@@ -1,6 +1,6 @@
-//! comms - per-mission agent coordination in one binary.
+//! orbal-net - per-mission agent coordination in one binary.
 //!
-//! `comms serve` is the authoritative per-mission server (host-side); every other
+//! `orbal-net serve` is the authoritative per-mission server (host-side); every other
 //! subcommand is the thin client that agents (orchestrator + in-VM leads/workers)
 //! call. One source of truth per mission: agents / rooms / messages / read-cursors,
 //! persisted in SQLite so a server restart mid-mission loses nothing.
@@ -9,24 +9,24 @@
 //! binds 0.0.0.0 so local-NAT + remote containers can dial in). The client reads its
 //! target and identity from the environment:
 //!
-//!   COMMS_URL    base URL of the mission's server, e.g. http://10.0.0.4:54123
-//!   COMMS_TOKEN  the mission's bearer token
-//!   COMMS_AGENT  this caller's identity (role), e.g. lead-a / worker-a-1 / orchestrator
+//!   ORBAL_NET_URL    base URL of the mission's server, e.g. http://10.0.0.4:54123
+//!   ORBAL_NET_TOKEN  the mission's bearer token
+//!   ORBAL_NET_AGENT  this caller's identity (role), e.g. lead-a / worker-a-1 / orchestrator
 //!
-//!   comms serve --token <t> [--port N] [--db <path>]   # prints {"port": N} then serves
-//!   comms whoami | agents | rooms | inbox
-//!   comms status <active|idle|busy|done>
-//!   comms create-room <name> [--type public]
-//!   comms join <room> | leave <room> | destroy-room <room>
-//!   comms send <room> <message...>
-//!   comms dm <agent> <message...>
-//!   comms read <room> [--since <seq>]
-//!   comms wait <room> [--since <seq>] [--timeout <secs>]   # blocking long-poll read
-//!   comms invite <room> <agent> | kick <room> <agent>
-//!   comms event <room> <kind> [--task T] [--phase P] [--step N/M] [--percent P]
+//!   orbal-net serve --token <t> [--port N] [--db <path>]   # prints {"port": N} then serves
+//!   orbal-net whoami | agents | rooms | inbox
+//!   orbal-net status <active|idle|busy|done>
+//!   orbal-net create-room <name> [--type public]
+//!   orbal-net join <room> | leave <room> | destroy-room <room>
+//!   orbal-net send <room> <message...>
+//!   orbal-net dm <agent> <message...>
+//!   orbal-net read <room> [--since <seq>]
+//!   orbal-net wait <room> [--since <seq>] [--timeout <secs>]   # blocking long-poll read
+//!   orbal-net invite <room> <agent> | kick <room> <agent>
+//!   orbal-net event <room> <kind> [--task T] [--phase P] [--step N/M] [--percent P]
 //!               [--to AGENT] [--note <text...>]            # emit a progress event
-//!   comms progress <room> <N/M | P%> [--task T] [--note <text...>]  # sugar for `event step`
-//!   comms events <room> [--since <seq>]                     # non-consuming event read
+//!   orbal-net progress <room> <N/M | P%> [--task T] [--note <text...>]  # sugar for `event step`
+//!   orbal-net events <room> [--since <seq>]                     # non-consuming event read
 
 #![warn(clippy::all)]
 
@@ -40,7 +40,7 @@ mod server;
 mod tui;
 
 const USAGE: &str = "\
-comms <subcommand> [args]
+orbal-net <subcommand> [args]
   serve --token <t> [--port N] [--db <path>]
   whoami | agents | rooms | inbox
   status <active|idle|busy|done>
@@ -59,7 +59,7 @@ comms <subcommand> [args]
   tui [--interval <secs>]   # live full-screen dashboard (alias: watch)";
 
 fn die(msg: impl AsRef<str>) -> ! {
-    eprintln!("comms: {}", msg.as_ref());
+    eprintln!("orbal-net: {}", msg.as_ref());
     std::process::exit(1);
 }
 
@@ -73,7 +73,7 @@ fn main() {
         Some("serve") => server::run(&args[1..]),
         Some("tui") | Some("watch") => tui::run(&args[1..]),
         Some("--selfcheck") => match server::selfcheck() {
-            Ok(()) => println!("comms selfcheck ok"),
+            Ok(()) => println!("orbal-net selfcheck ok"),
             Err(e) => die(format!("selfcheck failed: {e}")),
         },
         Some(_) => client(&args),
@@ -134,14 +134,14 @@ fn client(argv: &[String]) {
         "whoami" | "agents" | "rooms" | "inbox" => {}
         "status" => {
             if rest.len() != 1 {
-                die("usage: comms status <active|idle|busy|done>");
+                die("usage: orbal-net status <active|idle|busy|done>");
             }
             body.insert("state".into(), json!(rest[0]));
         }
         "create-room" => {
             let (rtype, rest) = parse_opt(&rest, "--type");
             if rest.len() != 1 {
-                die("usage: comms create-room <name> [--type public]");
+                die("usage: orbal-net create-room <name> [--type public]");
             }
             body.insert("name".into(), json!(rest[0]));
             if let Some(t) = rtype {
@@ -150,20 +150,20 @@ fn client(argv: &[String]) {
         }
         "join" | "leave" | "destroy-room" => {
             if rest.len() != 1 {
-                die(format!("usage: comms {cmd} <room>"));
+                die(format!("usage: orbal-net {cmd} <room>"));
             }
             body.insert("room".into(), json!(rest[0]));
         }
         "send" => {
             if rest.len() < 2 {
-                die("usage: comms send <room> <message...>");
+                die("usage: orbal-net send <room> <message...>");
             }
             body.insert("room".into(), json!(rest[0]));
             body.insert("text".into(), json!(rest[1..].join(" ")));
         }
         "dm" => {
             if rest.len() < 2 {
-                die("usage: comms dm <agent> <message...>");
+                die("usage: orbal-net dm <agent> <message...>");
             }
             body.insert("to".into(), json!(rest[0]));
             body.insert("text".into(), json!(rest[1..].join(" ")));
@@ -171,7 +171,7 @@ fn client(argv: &[String]) {
         "read" | "peek" => {
             let (since, rest) = parse_opt(&rest, "--since");
             if rest.len() != 1 {
-                die(format!("usage: comms {cmd} <room> [--since <seq>]"));
+                die(format!("usage: orbal-net {cmd} <room> [--since <seq>]"));
             }
             body.insert("room".into(), json!(rest[0]));
             if let Some(s) = since {
@@ -186,7 +186,7 @@ fn client(argv: &[String]) {
             let (since, rest) = parse_opt(&rest, "--since");
             let (timeout, rest) = parse_opt(&rest, "--timeout");
             if rest.len() != 1 {
-                die("usage: comms wait <room> [--since <seq>] [--timeout <secs>]");
+                die("usage: orbal-net wait <room> [--since <seq>] [--timeout <secs>]");
             }
             body.insert("room".into(), json!(rest[0]));
             if let Some(s) = since {
@@ -199,7 +199,7 @@ fn client(argv: &[String]) {
         }
         "invite" | "kick" => {
             if rest.len() != 2 {
-                die(format!("usage: comms {cmd} <room> <agent>"));
+                die(format!("usage: orbal-net {cmd} <room> <agent>"));
             }
             body.insert("room".into(), json!(rest[0]));
             body.insert("target".into(), json!(rest[1]));
@@ -213,7 +213,7 @@ fn client(argv: &[String]) {
             let (percent, rest) = parse_opt(&rest, "--percent");
             let (to, rest) = parse_opt(&rest, "--to");
             if rest.len() != 2 {
-                die("usage: comms event <room> <kind> [--task T] [--phase P] [--step N/M] [--percent P] [--to AGENT] [--note <text...>]");
+                die("usage: orbal-net event <room> <kind> [--task T] [--phase P] [--step N/M] [--percent P] [--to AGENT] [--note <text...>]");
             }
             body.insert("room".into(), json!(rest[0]));
             body.insert("kind".into(), json!(rest[1]));
@@ -246,7 +246,7 @@ fn client(argv: &[String]) {
             let (rest, note) = split_note(&rest);
             let (task, rest) = parse_opt(&rest, "--task");
             if rest.len() != 2 {
-                die("usage: comms progress <room> <N/M | P%> [--task T] [--note <text...>]");
+                die("usage: orbal-net progress <room> <N/M | P%> [--task T] [--note <text...>]");
             }
             body.insert("room".into(), json!(rest[0]));
             body.insert("kind".into(), json!("step"));
@@ -271,7 +271,7 @@ fn client(argv: &[String]) {
         "events" => {
             let (since, rest) = parse_opt(&rest, "--since");
             if rest.len() != 1 {
-                die("usage: comms events <room> [--since <seq>]");
+                die("usage: orbal-net events <room> [--since <seq>]");
             }
             body.insert("room".into(), json!(rest[0]));
             if let Some(s) = since {
@@ -279,16 +279,16 @@ fn client(argv: &[String]) {
             }
         }
         other => die(format!(
-            "unknown command {other:?} (see comms with no args)"
+            "unknown command {other:?} (see orbal-net with no args)"
         )),
     }
 
-    let url = env::var("COMMS_URL").ok();
-    let token = env::var("COMMS_TOKEN").ok();
-    let agent = env::var("COMMS_AGENT").ok();
+    let url = env::var("ORBAL_NET_URL").ok();
+    let token = env::var("ORBAL_NET_TOKEN").ok();
+    let agent = env::var("ORBAL_NET_AGENT").ok();
     let (url, token, agent) = match (url, token, agent) {
         (Some(u), Some(t), Some(a)) if !u.is_empty() && !t.is_empty() && !a.is_empty() => (u, t, a),
-        _ => die("COMMS_URL, COMMS_TOKEN and COMMS_AGENT must all be set"),
+        _ => die("ORBAL_NET_URL, ORBAL_NET_TOKEN and ORBAL_NET_AGENT must all be set"),
     };
     body.insert("agent".into(), json!(agent));
     let payload = Value::Object(body).to_string();
@@ -318,7 +318,7 @@ fn client(argv: &[String]) {
     }
 }
 
-/// Minimal HTTP/1.1 POST over a plain TCP socket. COMMS_URL is always `http://`
+/// Minimal HTTP/1.1 POST over a plain TCP socket. ORBAL_NET_URL is always `http://`
 /// (LAN/loopback, Bearer-token auth, no TLS), so a hand-rolled request beats
 /// pulling in a full HTTP+TLS client stack for one call.
 pub(crate) fn http_post(
@@ -332,7 +332,7 @@ pub(crate) fn http_post(
         .trim()
         .trim_end_matches('/')
         .strip_prefix("http://")
-        .ok_or_else(|| io_err("COMMS_URL must start with http://"))?;
+        .ok_or_else(|| io_err("ORBAL_NET_URL must start with http://"))?;
     let (hostport, base_path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, ""),

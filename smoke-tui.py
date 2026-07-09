@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Smoke test for `comms tui`. Self-contained: spawns its own comms server,
+"""Smoke test for `orbal-net tui`. Self-contained: spawns its own orbal-net server,
 seeds a mission (messages + every progress-event kind), drives the TUI through a
 PTY, and asserts it renders live data, drills into a room's thread and back out,
 shows the progress panel, flips CONNECTED->DISCONNECTED when the server dies,
 recovers when it returns, and quits cleanly. Exits 0 iff every check passes.
 
-    python3 comms/smoke-tui.py        # builds the release binary if missing
+    python3 smoke-tui.py        # builds the release binary if missing
 
 Traps baked in so we don't thrash on this again:
   - ratatui needs a PTY *with a winsize* or it draws an empty frame -> we set it.
@@ -21,14 +21,14 @@ Traps baked in so we don't thrash on this again:
 import os, pty, re, select, signal, struct, subprocess, sys, tempfile, termios, time, fcntl
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-BIN = os.path.join(HERE, "target", "release", "comms")
+BIN = os.path.join(HERE, "target", "release", "orbal-net")
 PORT, TOKEN = "7799", "smoke-tui-tok"
-DB = os.path.join(tempfile.gettempdir(), "comms-smoke-tui.db")
-ENV = dict(os.environ, COMMS_URL=f"http://127.0.0.1:{PORT}", COMMS_TOKEN=TOKEN, COMMS_AGENT="observer")
+DB = os.path.join(tempfile.gettempdir(), "orbal-net-smoke-tui.db")
+ENV = dict(os.environ, ORBAL_NET_URL=f"http://127.0.0.1:{PORT}", ORBAL_NET_TOKEN=TOKEN, ORBAL_NET_AGENT="observer")
 
 
 def cli(agent, *args, check=False):
-    return subprocess.run([BIN, *args], env=dict(ENV, COMMS_AGENT=agent),
+    return subprocess.run([BIN, *args], env=dict(ENV, ORBAL_NET_AGENT=agent),
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=check)
 
 
@@ -70,7 +70,7 @@ def main():
         subprocess.run(["cargo", "build", "--release"], cwd=HERE, check=True)
 
     # clean slate: no stray servers on our token, fresh db
-    subprocess.run(["pkill", "-f", f"comms serve --token {TOKEN}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["pkill", "-f", f"orbal-net serve --token {TOKEN}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(0.3)
     for p in (DB, DB + "-wal", DB + "-shm"):
         try: os.remove(p)
@@ -214,7 +214,7 @@ def main():
     ok = all(v for _, v in checks)
     for name, v in checks:
         print(f"  {'PASS' if v else 'FAIL'}  {name}")
-    print(f"\ncomms tui smoke: {'PASS' if ok else 'FAIL'}")
+    print(f"\norbal-net tui smoke: {'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1
 
 

@@ -1,14 +1,14 @@
-//! Render + interaction layer for `comms tui` (alias `watch`). Owned by worker-ui.
+//! Render + interaction layer for `orbal-net tui` (alias `watch`). Owned by worker-ui.
 //!
 //! Usage (launch in a herdr pane):
-//! - Inside an existing mission agent pane (COMMS_URL/COMMS_TOKEN/COMMS_AGENT
-//!   already set by spawn.py), just run: `comms tui`
+//! - Inside an existing mission agent pane (ORBAL_NET_URL/ORBAL_NET_TOKEN/ORBAL_NET_AGENT
+//!   already set by spawn.py), just run: `orbal-net tui`
 //! - In a dedicated observer pane that is NOT a mission agent, set the three env
-//!   vars yourself (any COMMS_AGENT value works - it reads only and is filtered
+//!   vars yourself (any ORBAL_NET_AGENT value works - it reads only and is filtered
 //!   out of the displayed roster automatically):
-//!   `COMMS_URL=http://<host>:<port> COMMS_TOKEN=<token> COMMS_AGENT=observer comms tui`
+//!   `ORBAL_NET_URL=http://<host>:<port> ORBAL_NET_TOKEN=<token> ORBAL_NET_AGENT=observer orbal-net tui`
 //! - `--interval <secs>` (fractional allowed) overrides the poll cadence, e.g.
-//!   `comms tui --interval 0.5`
+//!   `orbal-net tui --interval 0.5`
 //!
 //! Keys: q / Ctrl-C quit; Up/k and Down/j move the room selection (or scroll the
 //! thread when drilled in); Enter drills into the selected room's live thread;
@@ -276,7 +276,10 @@ fn draw_header(f: &mut Frame, area: Rect, cfg: &Config, snap: &Snapshot) {
     };
 
     let line1 = Line::from(vec![
-        Span::styled("comms tui", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "orbal-net tui",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
         Span::raw("  observer: "),
         Span::styled(cfg.agent.clone(), Style::default().fg(Color::Cyan)),
         Span::raw("  "),
@@ -292,7 +295,7 @@ fn draw_header(f: &mut Frame, area: Rect, cfg: &Config, snap: &Snapshot) {
     let header = Paragraph::new(vec![line1, line2]).block(
         Block::default()
             .borders(Borders::ALL)
-            .title("mission comms"),
+            .title("mission orbal-net"),
     );
     f.render_widget(header, area);
 }

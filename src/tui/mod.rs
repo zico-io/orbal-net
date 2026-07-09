@@ -1,5 +1,5 @@
-//! `comms tui` (alias `watch`) - a live, read-only full-screen dashboard over an
-//! existing mission comms server. It is NOT a mission agent: it reuses the same
+//! `orbal-net tui` (alias `watch`) - a live, read-only full-screen dashboard over an
+//! existing mission orbal-net server. It is NOT a mission agent: it reuses the same
 //! JSON-over-HTTP client as every other subcommand, reads globally (`agents` /
 //! `rooms`) and previews each room with `peek` (non-cursor-advancing) so it never
 //! eats messages real agents still need. The observer's own identity is filtered
@@ -29,7 +29,7 @@ mod view;
 pub struct Config {
     pub url: String,
     pub token: String,
-    /// Observer identity (COMMS_AGENT). Reads only; filtered from the roster view.
+    /// Observer identity (ORBAL_NET_AGENT). Reads only; filtered from the roster view.
     pub agent: String,
     /// Poll cadence for the background refresher.
     pub interval: Duration,
@@ -45,7 +45,7 @@ pub enum Health {
     Disconnected(String),
 }
 
-/// One agent as reported by `comms agents`.
+/// One agent as reported by `orbal-net agents`.
 #[derive(Clone, Debug)]
 pub struct AgentView {
     pub id: String,
@@ -99,7 +99,7 @@ pub struct RoomThread {
     pub items: Vec<ThreadItem>,
 }
 
-/// One room as reported by `comms rooms`, enriched with observed message activity.
+/// One room as reported by `orbal-net rooms`, enriched with observed message activity.
 #[derive(Clone, Debug)]
 pub struct RoomView {
     pub name: String,
@@ -213,18 +213,20 @@ impl Client {
     }
 }
 
-/// Entry point for `comms tui` / `comms watch`.
+/// Entry point for `orbal-net tui` / `orbal-net watch`.
 pub fn run(args: &[String]) {
     let interval = parse_interval(args).unwrap_or(Duration::from_secs(1));
 
     let (url, token, agent) = match (
-        env::var("COMMS_URL").ok().filter(|s| !s.is_empty()),
-        env::var("COMMS_TOKEN").ok().filter(|s| !s.is_empty()),
-        env::var("COMMS_AGENT").ok().filter(|s| !s.is_empty()),
+        env::var("ORBAL_NET_URL").ok().filter(|s| !s.is_empty()),
+        env::var("ORBAL_NET_TOKEN").ok().filter(|s| !s.is_empty()),
+        env::var("ORBAL_NET_AGENT").ok().filter(|s| !s.is_empty()),
     ) {
         (Some(u), Some(t), Some(a)) => (u, t, a),
         _ => {
-            eprintln!("comms tui: COMMS_URL, COMMS_TOKEN and COMMS_AGENT must all be set");
+            eprintln!(
+                "orbal-net tui: ORBAL_NET_URL, ORBAL_NET_TOKEN and ORBAL_NET_AGENT must all be set"
+            );
             std::process::exit(1);
         }
     };
@@ -261,7 +263,7 @@ pub fn run(args: &[String]) {
     let _ = poller.join();
 
     if let Err(e) = result {
-        eprintln!("comms tui: {e}");
+        eprintln!("orbal-net tui: {e}");
         std::process::exit(1);
     }
 }
