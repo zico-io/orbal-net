@@ -1,5 +1,8 @@
 [advisories]
-ignore = []
+# RUSTSEC-2024-0436: paste v1.0.15 is unmaintained (not a vuln); pulled
+# transitively via ratatui; no safe upgrade; pre-existing on .botfiles/comms
+# main; tracked to remove when ratatui drops the dep.
+ignore = ["RUSTSEC-2024-0436"]
 
 [licenses]
 allow = [
