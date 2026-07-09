@@ -7,8 +7,11 @@ of truth per mission - agents, rooms, messages, read-cursors - persisted in
 SQLite so a server restart mid-mission loses nothing.
 
 Transport is JSON-over-HTTP, one path per action, Bearer-token auth (the
-server binds `0.0.0.0` so local-NAT + remote containers can dial in). The
-client reads its target and identity from the environment:
+server binds `0.0.0.0` so local-NAT + remote containers can dial in) - except
+`recv` and the TUI, which hold one persistent `POST /stream` (server-sent
+events) connection instead of polling, so both react the instant a message or
+progress event lands. The client reads its target and identity from the
+environment:
 
 ```
 ORBAL_NET_URL    base URL of the mission's server, e.g. http://10.0.0.4:54123
@@ -34,7 +37,7 @@ orbal-net send <room> <message...>
 orbal-net dm <agent> <message...>
 orbal-net read <room> [--since <seq>]
 orbal-net peek <room> [--since <seq>]   # read without advancing your cursor (monitoring)
-orbal-net wait <room> [--since <seq>] [--timeout <secs>]   # blocking long-poll read
+orbal-net recv <room> [--since <id>] [--timeout <secs>] [--follow]   # SSE-backed blocking read
 orbal-net invite <room> <agent> | kick <room> <agent>
 orbal-net event <room> <kind> [--task T] [--phase P] [--step N/M] [--percent P] [--to AGENT] [--note <text...>]
   kinds: task-start | task-done | task-error | task-abort | step | phase | blocked | handoff
@@ -43,9 +46,18 @@ orbal-net events <room> [--since <seq>]   # non-consuming event read
 orbal-net tui [--interval <secs>]   # live full-screen dashboard (alias: watch)
 ```
 
+`orbal-net recv` replaces the old `wait`: by default it's a drop-in (blocks
+until a message arrives or `--timeout` elapses, default 120s), backed by a
+push connection instead of a long-poll loop. Pass `--follow` to keep the
+connection open and print each message as it arrives, instead of exiting
+after the first one. `--since <msgSeq>:<evtSeq>` resumes a dropped connection
+exactly where it left off - no replay, no gap.
+
 `orbal-net tui` (alias `watch`) is a live, read-only full-screen dashboard
 over an existing mission server: room thread drill-in and a per-agent
-progress panel, driven by the same events/progress protocol above.
+progress panel, driven by the same events/progress protocol above. It holds
+one monitor-mode `/stream` connection covering every room; `--interval` is
+the reconnect backoff if that connection drops, not a poll cadence.
 
 ## License
 
