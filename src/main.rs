@@ -36,7 +36,7 @@ use serde_json::{json, Value};
 use std::env;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 mod server;
 mod sse;
@@ -124,15 +124,19 @@ fn env_triple() -> (String, String, String) {
 }
 
 /// `orbal-net recv <room> [--since <id>] [--timeout <secs>] [--follow]` - SSE-backed
-/// replacement for `wait` (contract v1, mission-orbal-net-push wire contract seq 8).
-/// Default is a drop-in for `wait`: read frames until `: ready`; if any messages
-/// arrived during backfill, print `{room,messages:[...]}` (same shape `wait`/`read`
-/// returned) and exit. If none, keep reading until the first live message (print+exit)
-/// or `--timeout` elapses (default 120s -> print `{room,messages:[]}`, exit).
-/// `--follow` stays open and prints one JSON line per message as it arrives
-/// (ignores `--timeout`; exits on signal). The server never advances any cursor but
-/// the room's own consuming read cursor, so a plain `recv` behaves exactly like the
-/// old `wait` from the caller's perspective.
+/// replacement for `wait` (contract v2, mission-orbal-net-push - amended after a
+/// release-blocking bug: a v1 client that closed after its first message left the
+/// server's stream thread lingering in the live loop, so the NEXT message to land
+/// got consumed-and-lost into a dead socket. v2 fixes this by making the SERVER own
+/// the one-shot lifecycle: it sends `follow`/`timeout` in the request, and for
+/// `follow=false` the server itself closes the connection once it has delivered
+/// everything for this call (backlog, or whatever arrived while parked up to
+/// `timeout`) - no thread ever lingers past one call. The client's job is just to
+/// read every message frame until the server closes (never assume "first message"
+/// or "`: ready`" means done - the server may deliver a multi-message batch before
+/// closing), then print `{room,messages:[...]}` (empty on timeout), matching `wait`.
+/// `--follow` is a live, NON-CONSUMING tail (server-owned; never advances the room's
+/// read cursor) - it stays open printing one JSON line per message until killed.
 fn recv(args: &[String]) {
     let (since, args) = parse_opt(args, "--since");
     let (timeout, args) = parse_opt(&args, "--timeout");
@@ -157,7 +161,10 @@ fn recv(args: &[String]) {
         .unwrap_or(120);
 
     let (url, token, agent) = env_triple();
-    let payload = json!({ "agent": agent, "mode": "recv", "room": room }).to_string();
+    let payload = json!({
+        "agent": agent, "mode": "recv", "room": room, "follow": follow, "timeout": timeout_secs,
+    })
+    .to_string();
 
     let (code, stream) = open_stream(&url, &token, &payload, since.as_deref())
         .unwrap_or_else(|e| die(format!("cannot reach {url} ({e})")));
@@ -165,56 +172,47 @@ fn recv(args: &[String]) {
         die(format!("recv: {code} {}", read_error_detail(stream)));
     }
 
-    // Bound each blocking read to what's left of the deadline by shrinking the shared
-    // socket's read timeout every iteration; `--follow` never sets one (blocks
-    // forever). `try_clone` shares the same OS socket, so this affects the reads
-    // `SseReader`/`ChunkedReader` do through the moved-in `stream` below.
-    let timeout_clone = stream
-        .try_clone()
-        .unwrap_or_else(|e| die(format!("recv: {e}")));
-    let deadline = (!follow).then(|| Instant::now() + Duration::from_secs(timeout_secs));
-
-    let mut reader = sse::SseReader::new(sse::ChunkedReader::new(stream));
-    let mut backfill_msgs: Vec<Value> = Vec::new();
-    let mut in_backfill = true;
-
-    loop {
-        if let Some(dl) = deadline {
-            let now = Instant::now();
-            if now >= dl {
-                print_messages(&room, Vec::new());
-                return;
-            }
-            timeout_clone.set_read_timeout(Some(dl - now)).ok();
-        }
-        match reader.next_event() {
-            Ok(Some(sse::SseEvent::Comment(c))) => {
-                if c == "ready" {
-                    in_backfill = false;
-                    if !backfill_msgs.is_empty() {
-                        print_messages(&room, backfill_msgs);
-                        return;
-                    }
-                }
-                // keepalive, or a bare "ready" with nothing yet: keep reading.
-            }
-            Ok(Some(sse::SseEvent::Frame { event, data, .. })) if event == "message" => {
-                let msg: Value = serde_json::from_str(&data).unwrap_or(Value::Null);
-                if follow {
+    if follow {
+        // Live tail: blocks forever (no read timeout), one JSON line per message.
+        let mut reader = sse::SseReader::new(sse::ChunkedReader::new(stream));
+        loop {
+            match reader.next_event() {
+                Ok(Some(sse::SseEvent::Frame { event, data, .. })) if event == "message" => {
+                    let msg: Value = serde_json::from_str(&data).unwrap_or(Value::Null);
                     println!("{msg}");
-                } else if in_backfill {
-                    backfill_msgs.push(msg);
-                } else {
-                    print_messages(&room, vec![msg]);
-                    return;
                 }
+                Ok(Some(_)) => {} // ready/keepalive/other frame kinds: keep reading
+                Ok(None) => die("recv: server closed the stream"),
+                Err(e) => die(format!("recv: {e}")),
             }
-            Ok(Some(sse::SseEvent::Frame { .. })) => {} // not sent for mode=recv; ignore
-            Ok(None) => die("recv: server closed the stream"),
-            Err(e) if is_timeout(&e) => continue, // deadline check above handles expiry
+        }
+    }
+
+    // One-shot: the server is authoritative on when this call ends - it closes the
+    // connection itself once done (backlog delivered, or the timeout parked-wait
+    // resolved). Read every message frame until that close (`Ok(None)`); never
+    // return early on the first message; a `set_read_timeout` backstop well above
+    // the requested server timeout guards against a server that never closes.
+    stream
+        .set_read_timeout(Some(Duration::from_secs(timeout_secs + 10)))
+        .ok();
+    let mut reader = sse::SseReader::new(sse::ChunkedReader::new(stream));
+    let mut messages: Vec<Value> = Vec::new();
+    loop {
+        match reader.next_event() {
+            Ok(Some(sse::SseEvent::Frame { event, data, .. })) if event == "message" => {
+                messages.push(serde_json::from_str(&data).unwrap_or(Value::Null));
+            }
+            Ok(Some(_)) => {} // ready/keepalive/other: keep reading, server ends the call
+            Ok(None) => break, // server closed - the call is over
+            Err(e) if is_timeout(&e) => die(format!(
+                "recv: server did not close within {}s (backstop) - is it hung?",
+                timeout_secs + 10
+            )),
             Err(e) => die(format!("recv: {e}")),
         }
     }
+    print_messages(&room, messages);
 }
 
 fn is_timeout(e: &std::io::Error) -> bool {
