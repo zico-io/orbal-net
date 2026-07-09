@@ -44,6 +44,7 @@ orbal-net event <room> <kind> [--task T] [--phase P] [--step N/M] [--percent P] 
 orbal-net progress <room> <N/M | P%> [--task T] [--note <text...>]   # sugar for `event step`
 orbal-net events <room> [--since <seq>]   # non-consuming event read
 orbal-net tui [--interval <secs>]   # live full-screen dashboard (alias: watch)
+orbal-net skill [--install] [--dir <path>]   # print/install the bundled agent skill
 ```
 
 `orbal-net recv` replaces the old `wait`: by default it's a drop-in (blocks
@@ -62,6 +63,12 @@ over an existing mission server: room thread drill-in and a per-agent
 progress panel, driven by the same events/progress protocol above. It holds
 one monitor-mode `/stream` connection covering every room; `--interval` is
 the reconnect backoff if that connection drops, not a poll cadence.
+
+`orbal-net skill` prints the bundled [agent skill](SKILL.md) — a
+trigger-ready guide (rooms, messaging, the progress protocol, gotchas) for an
+AI agent driving this CLI. It's embedded in the binary, so `orbal-net skill
+--install` drops it into `~/.claude/skills/orbal-net/SKILL.md` (override the
+skills dir with `--dir`) with no network fetch.
 
 ## License
 

@@ -29,6 +29,7 @@
 //!               [--to AGENT] [--note <text...>]            # emit a progress event
 //!   orbal-net progress <room> <N/M | P%> [--task T] [--note <text...>]  # sugar for `event step`
 //!   orbal-net events <room> [--since <seq>]                     # non-consuming event read
+//!   orbal-net skill [--install] [--dir <path>]                  # print/install the agent skill
 
 #![warn(clippy::all)]
 
@@ -59,7 +60,8 @@ orbal-net <subcommand> [args]
     kinds: task-start | task-done | task-error | task-abort | step | phase | blocked | handoff
   progress <room> <N/M | P%> [--task T] [--note <text...>]   # sugar for `event step`
   events <room> [--since <seq>]   # non-consuming event read
-  tui [--interval <secs>]   # live full-screen dashboard (alias: watch)";
+  tui [--interval <secs>]   # live full-screen dashboard (alias: watch)
+  skill [--install] [--dir <path>]   # print the embedded agent skill, or install it";
 
 fn die(msg: impl AsRef<str>) -> ! {
     eprintln!("orbal-net: {}", msg.as_ref());
@@ -76,6 +78,7 @@ fn main() {
         Some("serve") => server::run(&args[1..]),
         Some("tui") | Some("watch") => tui::run(&args[1..]),
         Some("recv") => recv(&args[1..]),
+        Some("skill") => skill(&args[1..]),
         Some("--selfcheck") => match server::selfcheck() {
             Ok(()) => println!("orbal-net selfcheck ok"),
             Err(e) => die(format!("selfcheck failed: {e}")),
@@ -108,6 +111,31 @@ fn parse_flag(args: &[String], name: &str) -> (bool, Vec<String>) {
     } else {
         (false, args.to_vec())
     }
+}
+
+/// The agent skill, embedded at build time so it ships inside the binary and
+/// `orbal-net skill --install` needs no network fetch.
+const SKILL_MD: &str = include_str!("../SKILL.md");
+
+/// `orbal-net skill [--install] [--dir <path>]` - print the embedded SKILL.md, or with
+/// `--install` write it to `<dir>/orbal-net/SKILL.md` (default `~/.claude/skills`) and
+/// print the path.
+fn skill(args: &[String]) {
+    let (install, args) = parse_flag(args, "--install");
+    let (dir, _) = parse_opt(&args, "--dir");
+    if !install {
+        print!("{SKILL_MD}");
+        return;
+    }
+    let base = dir.unwrap_or_else(|| {
+        let home = env::var("HOME").unwrap_or_else(|_| die("HOME not set; pass --dir"));
+        format!("{home}/.claude/skills")
+    });
+    let dest_dir = format!("{base}/orbal-net");
+    std::fs::create_dir_all(&dest_dir).unwrap_or_else(|e| die(format!("create {dest_dir}: {e}")));
+    let dest = format!("{dest_dir}/SKILL.md");
+    std::fs::write(&dest, SKILL_MD).unwrap_or_else(|e| die(format!("write {dest}: {e}")));
+    println!("{dest}");
 }
 
 /// Read `ORBAL_NET_URL`/`ORBAL_NET_TOKEN`/`ORBAL_NET_AGENT`, or die with a usage
